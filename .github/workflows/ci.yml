@@ -33,15 +33,16 @@ jobs:
         run: docker build --tag korean-speech-openai:ci .
       - name: Check container startup without cloud credentials
         run: |
-          docker run --detach --rm --name speech-api-ci \
+          docker run --detach --name speech-api-ci \
             --read-only --tmpfs /tmp:size=128m,mode=1777 \
             --tmpfs /app/data:uid=10001,gid=10001 \
             --env PROXY_API_KEY=ci-only-not-a-real-secret-0000000000000000 \
             --publish 127.0.0.1:8787:8787 korean-speech-openai:ci
-          curl --fail --retry 10 --retry-connrefused --retry-delay 1 \
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --retry-max-time 30 --connect-timeout 1 --max-time 3 \
             http://127.0.0.1:8787/health
       - name: Container logs and cleanup
         if: always()
         run: |
           docker logs speech-api-ci 2>/dev/null || true
-          docker stop speech-api-ci 2>/dev/null || true
+          docker rm --force speech-api-ci 2>/dev/null || true

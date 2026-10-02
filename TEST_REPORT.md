@@ -25,7 +25,7 @@ git diff --check
 
 테스트 환경은 Linux ARM64, Python 3.12.3입니다. 의존성은 `requirements.txt`와 `requirements-dev.txt`에 고정했습니다. FastAPI 0.142.2, HTTPX 0.28.1, google-auth 2.59.1, OpenAI Python SDK 2.54.0을 실제 설치해 실행했습니다.
 
-최종 테스트는 총 137개입니다. 최종 로컬 전체 재실행 중 호스트 메모리·스왑 포화와 높은 I/O 대기가 발생해 일부 FFmpeg/ffprobe 검사가 10초 제한을 초과했습니다. 나머지 126개는 통과했고 실패 범위를 포함한 오디오 테스트 23개는 별도 재실행에서 모두 통과했습니다. 시간 제한을 늘려 실패를 숨기지 않았으며 최종 전체 실행은 GitHub Actions에서도 검증합니다.
+최종 테스트는 총 137개입니다. 최종 로컬 전체 재실행 중 호스트 메모리·스왑 포화와 높은 I/O 대기가 발생해 일부 FFmpeg/ffprobe 검사가 10초 제한을 초과했습니다. 나머지 126개는 통과했고 실패 범위를 포함한 오디오 테스트 23개는 별도 재실행에서 모두 통과했습니다. 시간 제한을 늘리지 않고 [GitHub Actions의 전체 테스트](https://github.com/RunaticMoon/korean-speach-openai/actions/runs/37012066766)에서도 통과를 확인했습니다.
 
 검증한 동작:
 
@@ -41,7 +41,7 @@ git diff --check
 
 ## 배포 검증
 
-Compose YAML과 Paseo JSON 예제를 파싱하고 설정을 검토했습니다. 이 개발 환경에는 Docker가 없어 로컬 Docker build/run을 실행하지 않았습니다. GitHub Actions에 의존성 설치, 정적 검사, 테스트, Docker 빌드, 비특권·읽기 전용 컨테이너의 `/health` 시작 확인을 구성했습니다. 실행 결과는 저장소의 [Actions](https://github.com/RunaticMoon/korean-speach-openai/actions)에서 확인할 수 있습니다.
+Compose YAML과 Paseo JSON 예제를 파싱하고 설정을 검토했습니다. 이 개발 환경에는 Docker가 없어 로컬 Docker build/run을 실행하지 않았습니다. GitHub Actions에서 의존성 설치, 정적 검사, 전체 테스트와 Docker 빌드가 통과했습니다. 첫 시작 검사는 Uvicorn 준비 전 Docker 포트 접속의 connection reset으로 실패하여, 한정된 시간 동안 준비를 기다리도록 수정했습니다. 비특권·읽기 전용 컨테이너의 `/health` 검사까지 포함한 최종 결과는 저장소의 [Actions](https://github.com/RunaticMoon/korean-speach-openai/actions)에서 확인할 수 있습니다.
 
 ## 미검증 범위
 
