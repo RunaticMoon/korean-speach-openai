@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     )
 
     proxy_api_key: SecretStr
+    bind_ip: str = "127.0.0.1"
+    port: int = Field(default=8787, ge=1, le=65535)
     groq_api_key: SecretStr | None = None
     groq_free_tier_confirmed: bool = False
     groq_model: Literal["whisper-large-v3-turbo", "whisper-large-v3"] = "whisper-large-v3-turbo"

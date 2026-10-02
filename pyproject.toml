@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "korean-speech-openai"
-version = "1.1.0"
+version = "1.2.0"
 description = "OpenAI-compatible Korean speech bridge for Paseo, Groq and Google Cloud TTS"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1",
@@ -15,6 +16,13 @@ dependencies = [
   "python-multipart>=0.0.20,<1",
   "google-auth[requests]>=2.38,<3",
 ]
+
+[project.scripts]
+korean-speech-openai = "speech_proxy.cli:main"
+
+[project.urls]
+Repository = "https://github.com/RunaticMoon/korean-speach-openai"
+Documentation = "https://github.com/RunaticMoon/korean-speach-openai#readme"
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11,<1", "openai>=1.70,<3"]

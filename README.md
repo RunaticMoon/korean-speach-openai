@@ -17,7 +17,72 @@ http://127.0.0.1:8787/v1
 
 ## 빠른 시작
 
-필요한 것은 Python 3.12와 FFmpeg 또는 Docker Compose, Groq API 키, Google Cloud 프로젝트와 ADC 자격 증명입니다. Google AI Studio/Gemini API 키로는 이 구현에 인증할 수 없습니다.
+필요한 것은 Python 3.12 이상과 FFmpeg 또는 Docker Compose, Groq API 키, Google Cloud 프로젝트와 ADC 자격 증명입니다. Google AI Studio/Gemini API 키로는 이 구현에 인증할 수 없습니다.
+
+### uv 패키지로 설치
+
+저장소를 직접 관리하지 않고 GitHub에서 패키지를 설치할 수 있습니다. Git, `ffmpeg`·`ffprobe`가 필요하며 Ubuntu/Debian에서는 `sudo apt-get install git ffmpeg`로 준비합니다. uv가 없다면 [공식 설치 안내](https://docs.astral.sh/uv/getting-started/installation/)를 따라 먼저 설치합니다. 현재 PyPI에는 게시하지 않았으므로 아래 Git URL을 사용합니다.
+
+```bash
+uv tool install --python 3.12 'git+https://github.com/RunaticMoon/korean-speach-openai.git'
+korean-speech-openai init
+```
+
+uv가 Python과 의존성을 독립된 환경에 설치하고 `korean-speech-openai` 명령을 제공합니다. 명령을 찾지 못하면 `uv tool update-shell`을 실행한 뒤 새 셸을 엽니다. [uv 도구 설치·관리 안내](https://docs.astral.sh/uv/guides/tools/).
+
+`init`은 설정 파일 `~/.config/korean-speech-openai/server.env`를 권한 `600`으로 생성하고 `PROXY_API_KEY`에 난수를 넣습니다. 기존 파일은 덮어쓰지 않습니다. 설정 파일을 편집해 `GROQ_API_KEY`, `GOOGLE_CLOUD_PROJECT`를 채우고, Groq Free 플랜을 직접 확인한 뒤 `GROQ_FREE_TIER_CONFIRMED=true`로 바꿉니다.
+
+```bash
+nano "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/server.env"
+```
+
+[Google Cloud 인증](#google-cloud-인증)에 따라 ADC를 준비한 뒤 패키지 설정에 지정된 `~/.config/korean-speech-openai/google-adc.json` 위치에 복사합니다. 이미 사용 중인 ADC 파일이 있다면 `GOOGLE_APPLICATION_CREDENTIALS`에 그 절대 경로를 지정해도 됩니다.
+
+```bash
+cp "$HOME/.config/gcloud/application_default_credentials.json" \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/google-adc.json"
+chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/google-adc.json"
+korean-speech-openai serve
+```
+
+기본 주소는 `http://127.0.0.1:8787/v1`입니다. 패키지 CLI는 실행 디렉터리와 무관하게 사용자 설정 파일을 읽고, 사용량을 `~/.local/state/korean-speech-openai/usage.sqlite3`에 보관합니다. `XDG_CONFIG_HOME`과 `XDG_STATE_HOME`을 지정한 경우 각각 해당 디렉터리를 기준으로 합니다. 설정 경로는 `init --config /절대/경로/server.env`, `serve --config /절대/경로/server.env`처럼 변경할 수 있습니다. 주소·포트는 `serve --host 127.0.0.1 --port 8787`로 지정합니다.
+
+### Linux에서 서비스로 실행
+
+`serve`로 실행 중이라면 `Ctrl+C`로 종료한 뒤 다음 명령을 실행합니다. 현재 사용자의 systemd 서비스를 등록하고 활성화·시작합니다.
+
+```bash
+korean-speech-openai install-service
+korean-speech-openai status
+curl --fail http://127.0.0.1:8787/health
+```
+
+`install-service`에도 `--config`, `--host`, `--port`를 지정할 수 있습니다. `--no-start`는 서비스 파일을 설치하고 자동 시작을 활성화하되 즉시 시작하지 않습니다. 수동 시작은 `systemctl --user start korean-speech-openai.service`로 수행합니다. 서비스 등록 명령은 시작을 요청하므로 `status`와 `/health`로 실제 실행 상태를 확인합니다. 서비스는 uv가 설치한 Python 환경을 사용하므로 해당 디렉터리를 이동하거나 삭제하지 않습니다. 외부 키를 아직 설정하지 않았다면 프로세스와 `/health`는 동작해도 음성 API를 사용할 수 없습니다.
+
+서비스의 로그·재시작·중지는 다음과 같이 관리합니다. 설정 파일 변경 후에는 재시작합니다.
+
+```bash
+journalctl --user -u korean-speech-openai.service -n 50 --no-pager
+systemctl --user restart korean-speech-openai.service
+systemctl --user stop korean-speech-openai.service
+# 자동 시작도 해제하려면:
+systemctl --user disable --now korean-speech-openai.service
+```
+
+재부팅 후 로그인 전이나 로그아웃 후에도 실행하려면 사용자 linger가 필요합니다. 서버 관리 권한이 있는 사용자가 한 번 `sudo loginctl enable-linger "$(id -un)"`를 실행합니다. `install-service`는 이 시스템 설정이나 Paseo daemon 설정을 변경하지 않습니다.
+
+업데이트할 때는 uv로 패키지를 갱신한 뒤 `install-service`를 다시 실행해 서비스 파일을 갱신하고 다시 시작합니다. 기존에 `--config`, `--host`, `--port`를 지정했다면 같은 옵션을 다시 전달합니다. 사용자 설정·ADC·사용량 DB는 패키지 환경 외부에 보존됩니다.
+
+```bash
+uv tool upgrade korean-speech-openai
+korean-speech-openai install-service
+korean-speech-openai status
+curl --fail http://127.0.0.1:8787/health
+```
+
+### 소스 또는 Docker로 설치
+
+소스를 수정하거나 Docker Compose를 사용하는 경우 아래 방식으로 준비합니다. 이 방식은 프로젝트 루트의 `.env`를 사용합니다.
 
 ```bash
 git clone https://github.com/RunaticMoon/korean-speach-openai.git
@@ -52,14 +117,14 @@ mkdir -p secrets
 chmod 700 secrets
 ```
 
-`application-default login`이 출력하는 ADC 파일을 `secrets/google-adc.json`으로 복사합니다. Linux/macOS의 기본 경로를 사용하는 경우:
+`application-default login`이 출력하는 ADC 파일을 복사합니다. uv 설치는 앞서 안내한 사용자 설정 디렉터리를 사용하고, 소스·Docker 설치는 아래처럼 `secrets/google-adc.json`을 사용합니다. Linux/macOS의 기본 ADC 경로를 사용하는 경우:
 
 ```bash
 cp "$HOME/.config/gcloud/application_default_credentials.json" secrets/google-adc.json
 chmod 600 secrets/google-adc.json
 ```
 
-`YOUR_PROJECT_ID`와 `.env`의 `GOOGLE_CLOUD_PROJECT`는 실제 프로젝트 ID로 바꿉니다. 사용자에게 해당 프로젝트의 API 사용 권한이 있어야 합니다. 다른 클라우드에서 상시 운영할 때는 전용 자격 증명과 Workload Identity Federation 등 운영 환경에 맞는 ADC 구성을 사용합니다. 설정 파일이 외부 토큰 파일을 참조한다면 그 파일도 컨테이너에서 접근할 수 있어야 합니다. [Google TTS 인증](https://docs.cloud.google.com/text-to-speech/docs/authentication), [환경별 ADC 설정](https://docs.cloud.google.com/docs/authentication/provide-credentials-adc).
+`YOUR_PROJECT_ID`와 `server.env` 또는 `.env`의 `GOOGLE_CLOUD_PROJECT`는 실제 프로젝트 ID로 바꿉니다. 사용자에게 해당 프로젝트의 API 사용 권한이 있어야 합니다. 다른 클라우드에서 상시 운영할 때는 전용 자격 증명과 Workload Identity Federation 등 운영 환경에 맞는 ADC 구성을 사용합니다. 설정 파일이 외부 토큰 파일을 참조한다면 그 파일도 컨테이너에서 접근할 수 있어야 합니다. [Google TTS 인증](https://docs.cloud.google.com/text-to-speech/docs/authentication), [환경별 ADC 설정](https://docs.cloud.google.com/docs/authentication/provide-credentials-adc).
 
 ADC 탐색과 토큰 갱신은 실제 TTS 요청 시 수행됩니다. `/health` 또는 `/ready` 성공만으로 Google의 권한·결제·네트워크 연결까지 확인된 것은 아닙니다.
 
@@ -111,7 +176,7 @@ uvicorn speech_proxy.app:app --host 127.0.0.1 --port 8787
 
 설정 대상은 휴대폰·데스크톱 UI가 아니라 **실제로 실행 중인 Paseo daemon의 설정 파일**입니다. 기본 위치는 `~/.paseo/config.json`이며 `PASEO_HOME`을 변경했다면 그 홈을 사용합니다.
 
-[examples/paseo.config.json](examples/paseo.config.json)의 내용을 기존 설정에 병합하고 `REPLACE_WITH_YOUR_PROXY_API_KEY` 두 곳을 `.env`의 `PROXY_API_KEY`로 바꿉니다. 기존 `agents`, `daemon`, `features.voiceMode.llm` 등의 설정을 덮어쓰지 않습니다.
+[examples/paseo.config.json](examples/paseo.config.json)의 내용을 기존 설정에 병합하고 `REPLACE_WITH_YOUR_PROXY_API_KEY` 두 곳을 `server.env` 또는 `.env`의 `PROXY_API_KEY`로 바꿉니다. 기존 `agents`, `daemon`, `features.voiceMode.llm` 등의 설정을 덮어쓰지 않습니다.
 
 ```json
 {
