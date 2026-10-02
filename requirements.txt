@@ -1,0 +1,8 @@
+# Direct dependencies pinned; see TEST_REPORT.md for the exact tested environment.
+fastapi==0.128.2
+starlette==0.50.0
+uvicorn==0.48.0
+httpx==0.28.1
+pydantic==2.13.4
+python-multipart==0.0.29
+google-auth[requests]>=2.38,<3
