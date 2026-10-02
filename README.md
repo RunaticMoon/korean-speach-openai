@@ -17,7 +17,7 @@ http://127.0.0.1:8787/v1
 
 ## 빠른 시작
 
-필요한 것은 Python 3.12 이상과 FFmpeg 또는 Docker Compose, Groq API 키, Google Cloud 프로젝트와 ADC 자격 증명입니다. Google AI Studio/Gemini API 키로는 이 구현에 인증할 수 없습니다.
+필요한 것은 Python 3.12 이상과 FFmpeg 또는 Docker Compose, Groq API 키, Google Cloud Text-to-Speech용 API 키 또는 ADC 자격 증명입니다. Google 쪽은 해당 프로젝트의 Cloud Text-to-Speech API 활성화와 결제 연결이 필요합니다.
 
 ### uv 패키지로 설치
 
@@ -30,18 +30,21 @@ korean-speech-openai init
 
 uv가 Python과 의존성을 독립된 환경에 설치하고 `korean-speech-openai` 명령을 제공합니다. 명령을 찾지 못하면 `uv tool update-shell`을 실행한 뒤 새 셸을 엽니다. [uv 도구 설치·관리 안내](https://docs.astral.sh/uv/guides/tools/).
 
-`init`은 설정 파일 `~/.config/korean-speech-openai/server.env`를 권한 `600`으로 생성하고 `PROXY_API_KEY`에 난수를 넣습니다. 기존 파일은 덮어쓰지 않습니다. 설정 파일을 편집해 `GROQ_API_KEY`, `GOOGLE_CLOUD_PROJECT`를 채우고, Groq Free 플랜을 직접 확인한 뒤 `GROQ_FREE_TIER_CONFIRMED=true`로 바꿉니다.
+`init`은 설정 파일 `~/.config/korean-speech-openai/server.env`를 권한 `600`으로 생성하고 `PROXY_API_KEY`에 난수를 넣습니다. 기존 파일은 덮어쓰지 않습니다. 설정 파일을 편집해 `GROQ_API_KEY`와 Google 인증 정보를 채우고, Groq Free 플랜을 직접 확인한 뒤 `GROQ_FREE_TIER_CONFIRMED=true`로 바꿉니다.
 
 ```bash
 nano "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/server.env"
 ```
 
-[Google Cloud 인증](#google-cloud-인증)에 따라 ADC를 준비한 뒤 패키지 설정에 지정된 `~/.config/korean-speech-openai/google-adc.json` 위치에 복사합니다. 이미 사용 중인 ADC 파일이 있다면 `GOOGLE_APPLICATION_CREDENTIALS`에 그 절대 경로를 지정해도 됩니다.
+가장 간단한 Google 설정은 Cloud Console에서 발급한 Cloud TTS용 키를 `GOOGLE_API_KEY`에 넣는 것입니다. 이 방식은 `GOOGLE_CLOUD_PROJECT`와 ADC 파일이 필요하지 않습니다. 프로젝트와 과금 대상은 키에서 결정됩니다.
+
+```dotenv
+GOOGLE_API_KEY=본인의_Cloud_TTS_API_키
+```
+
+ADC를 사용하려면 `GOOGLE_API_KEY`를 비우고 [Google Cloud 인증](#google-cloud-인증)에 따라 `GOOGLE_CLOUD_PROJECT`와 ADC를 준비합니다. 패키지 기본 ADC 경로는 `~/.config/korean-speech-openai/google-adc.json`이며, 기존 ADC 파일의 절대 경로를 `GOOGLE_APPLICATION_CREDENTIALS`에 지정해도 됩니다. Google 인증 설정을 마친 뒤 실행합니다.
 
 ```bash
-cp "$HOME/.config/gcloud/application_default_credentials.json" \
-  "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/google-adc.json"
-chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/google-adc.json"
 korean-speech-openai serve
 ```
 
@@ -98,6 +101,13 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 PROXY_API_KEY=여기에_직접_생성한_32자_이상의_난수
 GROQ_API_KEY=본인의_Groq_API_키
 GROQ_FREE_TIER_CONFIRMED=true
+GOOGLE_API_KEY=본인의_Cloud_TTS_API_키
+```
+
+ADC를 사용하는 경우에는 위의 `GOOGLE_API_KEY` 대신 다음 값을 설정합니다.
+
+```dotenv
+GOOGLE_API_KEY=
 GOOGLE_CLOUD_PROJECT=본인의_Google_Cloud_프로젝트_ID
 GOOGLE_APPLICATION_CREDENTIALS=./secrets/google-adc.json
 ```
@@ -106,31 +116,53 @@ GOOGLE_APPLICATION_CREDENTIALS=./secrets/google-adc.json
 
 ### Google Cloud 인증
 
-프로젝트에 결제를 연결하고 Cloud Text-to-Speech API를 활성화합니다. 로컬 개발용 사용자 ADC는 다음과 같이 준비할 수 있습니다.
+프로젝트에 결제를 연결하고 Cloud Text-to-Speech API를 활성화한 뒤 아래 두 방식 중 하나를 선택합니다.
+
+#### Cloud TTS API 키
+
+Cloud Console의 **API 및 서비스 → 사용자 인증 정보**에서 API 키를 만들고, API 제한에 **Cloud Text-to-Speech API**를 지정합니다. 서버의 고정 외부 IP를 사용하는 경우 해당 IP로 애플리케이션 제한도 설정할 수 있습니다. 키 값은 `server.env` 또는 `.env`의 `GOOGLE_API_KEY`에 저장합니다. [Google API 키 생성·제한 안내](https://docs.cloud.google.com/docs/authentication/api-keys).
+
+`GOOGLE_API_KEY`가 있으면 서버는 Google 요청의 `x-goog-api-key` 헤더로 전달하며 ADC와 `GOOGLE_CLOUD_PROJECT`를 사용하지 않습니다. 기본 ADC 경로에 파일이 없어도 API 키 방식으로 실행됩니다. Google이 키를 거절하면 오류를 반환하고 ADC로 자동 재시도하지 않습니다. ADC로 전환하려면 키 값을 비우고 서비스를 재시작합니다. [Google API 키 사용 안내](https://docs.cloud.google.com/docs/authentication/api-keys-use).
+
+Google AI Studio에서 Gemini용으로 준비한 키만으로 Cloud TTS 설정까지 완료된 것은 아닙니다. 해당 키 프로젝트의 Cloud TTS API 활성화·결제 연결·API 제한을 확인해야 합니다.
+
+#### ADC
+
+`GOOGLE_API_KEY`를 비우고 `GOOGLE_CLOUD_PROJECT`를 지정합니다. 로컬 개발용 사용자 ADC는 다음과 같이 준비할 수 있습니다.
 
 ```bash
 gcloud auth login
 gcloud services enable texttospeech.googleapis.com --project=YOUR_PROJECT_ID
 gcloud auth application-default login
 gcloud auth application-default set-quota-project YOUR_PROJECT_ID
-mkdir -p secrets
-chmod 700 secrets
 ```
 
-`application-default login`이 출력하는 ADC 파일을 복사합니다. uv 설치는 앞서 안내한 사용자 설정 디렉터리를 사용하고, 소스·Docker 설치는 아래처럼 `secrets/google-adc.json`을 사용합니다. Linux/macOS의 기본 ADC 경로를 사용하는 경우:
+`application-default login`이 출력하는 ADC 파일을 복사합니다. Linux/macOS의 기본 ADC 경로와 uv 설치의 기본 설정 경로를 사용하는 경우:
 
 ```bash
+cp "$HOME/.config/gcloud/application_default_credentials.json" \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/google-adc.json"
+chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/korean-speech-openai/google-adc.json"
+```
+
+소스·Docker 설치에서는 프로젝트 디렉터리의 `secrets/google-adc.json`을 사용합니다.
+
+```bash
+mkdir -p secrets
+chmod 700 secrets
 cp "$HOME/.config/gcloud/application_default_credentials.json" secrets/google-adc.json
 chmod 600 secrets/google-adc.json
 ```
 
 `YOUR_PROJECT_ID`와 `server.env` 또는 `.env`의 `GOOGLE_CLOUD_PROJECT`는 실제 프로젝트 ID로 바꿉니다. 사용자에게 해당 프로젝트의 API 사용 권한이 있어야 합니다. 다른 클라우드에서 상시 운영할 때는 전용 자격 증명과 Workload Identity Federation 등 운영 환경에 맞는 ADC 구성을 사용합니다. 설정 파일이 외부 토큰 파일을 참조한다면 그 파일도 컨테이너에서 접근할 수 있어야 합니다. [Google TTS 인증](https://docs.cloud.google.com/text-to-speech/docs/authentication), [환경별 ADC 설정](https://docs.cloud.google.com/docs/authentication/provide-credentials-adc).
 
-ADC 탐색과 토큰 갱신은 실제 TTS 요청 시 수행됩니다. `/health` 또는 `/ready` 성공만으로 Google의 권한·결제·네트워크 연결까지 확인된 것은 아닙니다.
+ADC 방식의 자격 증명 탐색과 토큰 갱신은 실제 TTS 요청 시 수행됩니다. 두 인증 방식 모두 `/health` 또는 `/ready` 성공만으로 Google의 키 유효성·권한·결제·네트워크 연결까지 확인된 것은 아닙니다.
 
 ### Docker Compose 실행
 
-컨테이너는 **UID/GID 10001**로 실행됩니다. `secrets/google-adc.json`은 읽기 전용으로 마운트하며 이 UID가 읽을 수 있어야 합니다. 일반적인 Linux Docker에서는 ACL로 해당 UID에만 읽기 권한을 줄 수 있습니다.
+기본 Compose 파일과 아래 예시는 **ADC 방식**을 사용합니다. API 키만 사용하려면 `.env`에 `GOOGLE_API_KEY`를 설정하고 `compose.yaml`에서 `./secrets/google-adc.json`의 bind mount와 `GOOGLE_APPLICATION_CREDENTIALS` 환경변수 항목을 제거합니다. 사용량을 보존하는 `speech-data` 볼륨은 유지하며 ADC 읽기 확인 단계는 생략합니다.
+
+컨테이너는 **UID/GID 10001**로 실행됩니다. ADC 방식에서는 `secrets/google-adc.json`을 읽기 전용으로 마운트하며 이 UID가 읽을 수 있어야 합니다. 일반적인 Linux Docker에서는 ACL로 해당 UID에만 읽기 권한을 줄 수 있습니다.
 
 ```bash
 # Linux에서 필요하면 먼저 배포판의 acl 패키지를 설치합니다.
@@ -162,7 +194,7 @@ python -m pip install -r requirements.txt
 uvicorn speech_proxy.app:app --host 127.0.0.1 --port 8787
 ```
 
-프로젝트 루트에서 실행하면 `.env` 설정을 읽습니다. 직접 실행할 때는 ADC 파일과 `data/` 디렉터리에 현재 사용자의 읽기·쓰기 권한이 있어야 합니다. `USAGE_DB_PATH`의 부모 디렉터리는 자동 생성됩니다.
+프로젝트 루트에서 실행하면 `.env` 설정을 읽습니다. 직접 실행할 때는 `data/` 디렉터리에 현재 사용자의 쓰기 권한이 있어야 하며, ADC 방식이라면 ADC 파일을 읽을 수 있어야 합니다. `USAGE_DB_PATH`의 부모 디렉터리는 자동 생성됩니다.
 
 `.env`의 `BIND_IP`와 `PORT`까지 적용하려면 `./scripts/run-local.sh`를 실행합니다. 원본의 `uvicorn app.main:create_app --factory` 진입점도 유지합니다.
 
@@ -328,15 +360,15 @@ docker build -t korean-speech-openai:test .
 
 실행 결과와 미검증 범위는 [TEST_REPORT.md](TEST_REPORT.md)에 기록합니다.
 
-**실제 Groq/Google API 호출, Google 토큰 발급, Paseo에서 마이크 입력과 스피커 재생까지의 종단 간 연결은 아직 검증하지 않았습니다.** 유효한 사용자 자격 증명을 설정한 뒤 짧은 녹음과 TTS 입력으로 직접 확인해야 합니다. 공유 대화에 기재된 과거 테스트 개수나 배포 성공 여부는 이 저장소의 검증 결과로 간주하지 않습니다.
+자동 테스트는 실제 공급자 키를 사용하지 않습니다. 유효한 사용자 자격 증명을 설정한 뒤 짧은 녹음과 TTS 입력으로 실제 Groq/Google 호출을 확인하고, Paseo의 마이크 입력과 스피커 재생까지 별도로 검증해야 합니다. ADC 방식은 Google 토큰 발급도 확인합니다. 공유 대화에 기재된 과거 테스트 개수나 배포 성공 여부는 이 저장소의 검증 결과로 간주하지 않습니다.
 
 ## 문제 해결
 
 | 증상 | 확인할 내용 |
 |---|---|
 | `401` | Paseo/SDK의 키가 `PROXY_API_KEY`와 같은지, Bearer 헤더가 있는지 |
-| 준비 상태 실패 | 필수 키·프로젝트·Groq Free 플랜 확인 설정과 FFmpeg 설치 |
-| Google 인증 실패 | ADC 파일 읽기 권한, API 활성화, quota project, 프로젝트 권한·결제 상태 |
+| 준비 상태 실패 | Groq 키·Free 플랜 확인 설정, Google API 키 또는 ADC·프로젝트 설정, FFmpeg 설치 |
+| Google 인증 실패 | API 키 방식은 키의 Cloud TTS API 제한·애플리케이션 제한·프로젝트 결제 상태, ADC 방식은 파일 읽기 권한·quota project·프로젝트 권한 확인 |
 | `429` | `/usage`의 예약량과 공급자 한도. 재시도마다 사용량이 추가될 수 있음 |
 | 한국어가 영어로 잘못 전사됨 | Paseo dictation과 voiceMode의 `language`가 모두 `ko`인지 |
 | TTS가 잡음이거나 속도가 다름 | 요청 형식 `pcm`과 24kHz PCM 계약, 잘못된 프록시 경로나 오래된 서버 이미지 |

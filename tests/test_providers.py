@@ -296,3 +296,113 @@ async def test_adc_explicit_credentials_file_and_quota_project(monkeypatch):
     assert calls[0][0] == "/safe/credentials.json"
     assert calls[0][1]["quota_project_id"] == "billing-project"
     assert headers == {"Authorization": "Bearer token", "x-goog-user-project": "billing-project"}
+
+
+async def test_google_api_key_is_header_only_and_takes_precedence_over_adc(monkeypatch, caplog):
+    google_key = "test-google-cloud-api-key-1234567890"
+    adc_calls = []
+    requests = []
+    pcm = b"\0\0\1\0" * 100
+    wav, _ = await encode_audio(pcm, "wav", 10)
+
+    async def unexpected_adc(self):
+        adc_calls.append(True)
+        raise AssertionError("API key authentication must not load ADC")
+
+    monkeypatch.setattr(ADCAuth, "headers", unexpected_adc)
+
+    def handler(request):
+        requests.append(request)
+        assert request.headers["x-goog-api-key"] == google_key
+        assert "authorization" not in request.headers
+        assert "x-goog-user-project" not in request.headers
+        assert not request.url.query
+        assert google_key not in str(request.url)
+        assert google_key.encode() not in request.content
+        return httpx.Response(200, json={"audioContent": base64.b64encode(wav).decode()})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleProvider(
+            settings(
+                google_api_key=google_key,
+                google_application_credentials="/does-not-exist/google-adc.json",
+                google_cloud_project="must-not-be-used-as-quota-project",
+            ),
+            client,
+        )
+        result = await provider.synthesize("한국어 API 키 합성", "ko-KR-Wavenet-A", 1)
+
+    assert result == pcm
+    assert len(requests) == 1
+    assert not adc_calls
+    assert google_key not in caplog.text
+
+
+async def test_google_api_key_forbidden_does_not_retry_or_fall_back_to_adc(monkeypatch, caplog):
+    google_key = "test-google-cloud-api-key-1234567890"
+    calls = []
+    adc_calls = []
+
+    async def unexpected_adc(self):
+        adc_calls.append(True)
+        raise AssertionError("A rejected API key must not silently switch credentials")
+
+    monkeypatch.setattr(ADCAuth, "headers", unexpected_adc)
+
+    def handler(request):
+        calls.append(request)
+        assert request.headers["x-goog-api-key"] == google_key
+        return httpx.Response(403, text=f"Permission denied for private key {google_key}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleProvider(settings(google_api_key=google_key), client)
+        with pytest.raises(APIError) as error:
+            await provider.synthesize("안녕하세요", "ko-KR-Wavenet-A", 1)
+
+    assert len(calls) == 1
+    assert not adc_calls
+    assert error.value.status == 502
+    assert error.value.code == "upstream_authentication_error"
+    assert google_key not in json.dumps(error.value.payload())
+    assert google_key not in caplog.text
+
+
+async def test_injected_google_token_provider_still_overrides_configured_api_key():
+    google_key = "test-google-cloud-api-key-1234567890"
+    calls = []
+    wav, _ = await encode_audio(b"\0\0" * 100, "wav", 10)
+
+    def handler(request):
+        calls.append(request)
+        assert request.headers["authorization"] == "Bearer google-secret"
+        assert request.headers["x-goog-user-project"] == "test-project"
+        assert "x-goog-api-key" not in request.headers
+        return httpx.Response(200, json={"audioContent": base64.b64encode(wav).decode()})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await GoogleProvider(settings(google_api_key=google_key), client, token).synthesize(
+            "안녕하세요", "ko-KR-Wavenet-A", 1
+        )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("google_key", [None, ""])
+async def test_google_missing_or_empty_api_key_uses_default_adc(google_key, monkeypatch):
+    calls = []
+    credential = SimpleNamespace(valid=True, token="adc-access-token", quota_project_id="adc-quota")
+
+    def default(**kwargs):
+        calls.append(kwargs)
+        return credential, "adc-project"
+
+    monkeypatch.setattr("speech_proxy.providers.google.auth.default", default)
+    async with httpx.AsyncClient() as client:
+        provider = GoogleProvider(settings(google_api_key=google_key), client)
+        headers = await provider.authorize()
+
+    assert headers == {
+        "Authorization": "Bearer adc-access-token",
+        "x-goog-user-project": "adc-quota",
+    }
+    assert len(calls) == 1

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     groq_api_key: SecretStr | None = None
     groq_free_tier_confirmed: bool = False
     groq_model: Literal["whisper-large-v3-turbo", "whisper-large-v3"] = "whisper-large-v3-turbo"
+    google_api_key: SecretStr | None = None
     google_cloud_project: str | None = None
     google_application_credentials: str | None = None
     google_tts_voice: str = "ko-KR-Wavenet-A"
@@ -94,10 +95,23 @@ class Settings(BaseSettings):
             raise ValueError("Generate a random PROXY_API_KEY before starting the server")
         return value
 
-    @field_validator("groq_api_key", mode="before")
+    @field_validator("groq_api_key", "google_api_key", mode="before")
     @classmethod
     def empty_key_is_unset(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("google_api_key")
+    @classmethod
+    def valid_google_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None:
+            key = value.get_secret_value()
+            if (
+                not key
+                or not key.isascii()
+                or any(ord(char) <= 32 or ord(char) == 127 for char in key)
+            ):
+                raise ValueError("GOOGLE_API_KEY must contain ASCII characters without whitespace")
+        return value
 
     @field_validator("google_cloud_project", "google_application_credentials", mode="before")
     @classmethod

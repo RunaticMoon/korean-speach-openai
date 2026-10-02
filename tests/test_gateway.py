@@ -49,9 +49,10 @@ def multipart_fields(request):
 @pytest.fixture
 def gateway(tmp_path):
     @asynccontextmanager
-    async def start(**overrides):
+    async def start(*, use_default_google_auth=False, **overrides):
         state = SimpleNamespace(
             google_calls=[],
+            google_requests=[],
             groq_calls=[],
             auth_calls=0,
             google_status=200,
@@ -79,6 +80,7 @@ def gateway(tmp_path):
         async def handler(request):
             if request.url.host == "texttospeech.googleapis.com":
                 state.google_calls.append(json.loads(request.content))
+                state.google_requests.append(request)
                 state.google_started.set()
                 if state.google_delay:
                     await asyncio.sleep(state.google_delay)
@@ -112,7 +114,11 @@ def gateway(tmp_path):
             },
         )
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
-            app = create_app(settings, http_client=upstream, google_token_provider=tokens)
+            app = create_app(
+                settings,
+                http_client=upstream,
+                google_token_provider=None if use_default_google_auth else tokens,
+            )
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=app),
@@ -159,6 +165,56 @@ async def test_health_auth_discovery(gateway):
         voices = (await client.get("/v1/voices")).json()["data"]
         assert next(v for v in voices if v["id"] == "cedar")["provider_voice"].endswith("D")
         assert not state.google_calls and not state.groq_calls and not state.auth_calls
+
+
+@pytest.mark.parametrize("google_key", [None, "", "test-google-cloud-api-key-1234567890"])
+async def test_readiness_reports_google_auth_mode_without_secrets_or_provider_calls(
+    gateway, google_key
+):
+    async with gateway(google_api_key=google_key) as (client, state, _):
+        response = await client.get("/ready")
+
+        assert response.status_code == 200
+        assert response.json()["google_api_key_configured"] is bool(google_key)
+        assert response.json()["google_auth"] == (
+            "API key" if google_key else "ADC resolved on first synthesis"
+        )
+        assert response.json()["upstream_verified"] is False
+        assert not state.google_calls and not state.auth_calls
+        if google_key:
+            assert google_key not in response.text
+        assert KEY not in response.text
+
+
+async def test_speech_with_google_api_key_preserves_auth_quota_and_cache(gateway, monkeypatch):
+    google_key = "test-google-cloud-api-key-1234567890"
+
+    async def unexpected_adc(self):
+        raise AssertionError("API key synthesis must not access ADC")
+
+    monkeypatch.setattr("speech_proxy.providers.ADCAuth.headers", unexpected_adc)
+    async with gateway(
+        use_default_google_auth=True,
+        google_api_key=google_key,
+        google_application_credentials="/nonexistent/google-adc.json",
+    ) as (client, state, _):
+        responses = [
+            await client.post("/v1/audio/speech", json=speech_body(response_format="pcm"))
+            for _ in range(2)
+        ]
+
+        assert all(response.status_code == 200 for response in responses)
+        assert all(response.content == state.pcm for response in responses)
+        assert [response.headers["x-tts-cache"] for response in responses] == ["MISS", "HIT"]
+        assert len(state.google_requests) == 1
+        request = state.google_requests[0]
+        assert request.headers["x-goog-api-key"] == google_key
+        assert "authorization" not in request.headers
+        assert "x-goog-user-project" not in request.headers
+        assert not request.url.query
+        assert google_key.encode() not in request.content
+        assert not state.auth_calls
+        assert (await counters(client))["google_tts"]["32_days"]["amount"] == len("안녕하세요")
 
 
 @pytest.mark.parametrize("fmt", ["json", "text", "verbose_json", "srt", "vtt"])

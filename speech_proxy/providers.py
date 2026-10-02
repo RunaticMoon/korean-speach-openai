@@ -245,7 +245,14 @@ class GoogleProvider:
             settings.upstream_timeout_seconds,
             settings.google_application_credentials,
         )
-        self.token_provider = token_provider or self.auth.headers
+        self.token_provider = token_provider or self._default_headers
+
+    async def _default_headers(self) -> dict[str, str]:
+        if self.settings.google_api_key is not None:
+            # A Cloud TTS key identifies its own quota project. Keep it out of URLs,
+            # and never fall back to another identity when Google rejects the key.
+            return {"x-goog-api-key": self.settings.google_api_key.get_secret_value()}
+        return await self.auth.headers()
 
     async def authorize(self) -> dict[str, str]:
         return await self.token_provider()

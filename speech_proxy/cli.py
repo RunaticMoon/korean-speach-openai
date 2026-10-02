@@ -84,6 +84,8 @@ def initialize(config: Path) -> None:
         "GROQ_FREE_TIER_CONFIRMED=false\n"
         "GROQ_MODEL=whisper-large-v3-turbo\n"
         "ASR_DEFAULT_LANGUAGE=ko\n"
+        "# Cloud Text-to-Speech API key; leave blank to use ADC instead.\n"
+        "GOOGLE_API_KEY=\n"
         "GOOGLE_CLOUD_PROJECT=\n"
         f"GOOGLE_APPLICATION_CREDENTIALS={_dotenv_quote(str(config.parent / 'google-adc.json'))}\n"
         "GOOGLE_TTS_VOICE=ko-KR-Wavenet-A\n"
@@ -99,7 +101,7 @@ def initialize(config: Path) -> None:
     )
     created = _private_write(config, text)
     print(f"{'Created' if created else 'Preserved'} configuration: {config}")
-    print("Add your Groq key and Google Cloud ADC before using speech APIs.")
+    print("Add your Groq key and a Google Cloud TTS API key or ADC before using speech APIs.")
 
 
 def _load_settings(config: Path, host: str | None, port: int | None) -> Settings:

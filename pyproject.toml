@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "korean-speech-openai"
-version = "1.2.0"
+version = "1.2.1"
 description = "OpenAI-compatible Korean speech bridge for Paseo, Groq and Google Cloud TTS"
 readme = "README.md"
 requires-python = ">=3.12"

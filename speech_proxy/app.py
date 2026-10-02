@@ -165,7 +165,12 @@ def create_app(
             "status": "ok",
             "groq_key_configured": config.groq_api_key is not None,
             "groq_free_tier_confirmed": config.groq_free_tier_confirmed,
-            "google_auth": "ADC resolved on first synthesis",
+            "google_api_key_configured": config.google_api_key is not None,
+            "google_auth": (
+                "API key"
+                if config.google_api_key is not None
+                else "ADC resolved on first synthesis"
+            ),
             "upstream_verified": False,
         }
 
