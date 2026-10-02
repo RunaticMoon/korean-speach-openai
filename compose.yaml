@@ -3,10 +3,11 @@ services:
     build: .
     restart: unless-stopped
     init: true
-    env_file: .env
+    env_file:
+      - .env
     environment:
       GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/google-adc.json
-      DATA_DIR: /app/data
+      USAGE_DB_PATH: /app/data/usage.sqlite3
     ports:
       - "${BIND_IP:-127.0.0.1}:${PORT:-8787}:8787"
     volumes:
@@ -17,18 +18,15 @@ services:
         read_only: true
         bind:
           create_host_path: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
-    cap_drop: [ALL]
-    security_opt:
-      - no-new-privileges:true
     pids_limit: 128
     mem_limit: 768m
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+
 volumes:
   speech-data:

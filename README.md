@@ -1,246 +1,280 @@
-# Korean Speech → OpenAI-compatible gateway
+# Korean Speech OpenAI Bridge
 
-Groq Free-plan ASR + Google Cloud WaveNet TTS를 OpenAI Audio REST 형태로 제공하는 개인용 중계 서버입니다.
+Paseo의 한국어 받아쓰기·음성 대화에 연결하는 OpenAI Audio API 호환 서버입니다. 음성 인식은 **Groq Whisper**, 음성 합성은 **Google Cloud 한국어 Standard/WaveNet**으로 처리합니다. Python 3.12, FastAPI, FFmpeg를 사용합니다.
 
 ```text
-음성 기능을 지원하는 앱 / OpenAI SDK
-               ↓ Bearer PROXY_API_KEY
-          이 서버의 /v1
-               ├── /audio/transcriptions → Groq whisper-large-v3-turbo
-               └── /audio/speech         → Google ko-KR-Wavenet-A/B/C/D
+Paseo daemon / OpenAI SDK
+          │  Bearer PROXY_API_KEY
+          ▼
+http://127.0.0.1:8787/v1
+          ├─ /audio/transcriptions → Groq whisper-large-v3-turbo
+          └─ /audio/speech         → Google Cloud Text-to-Speech
 ```
 
-**이 서버는 OpenAI 서비스를 호출하지 않습니다.** `whisper-1`, `tts-1`, `alloy` 등은 로컬 호환 별칭입니다. 실제 OpenAI 모델·목소리를 재현하지 않습니다. 일반 LLM의 `/chat/completions`나 `/responses`를 중계하는 서버도 아닙니다.
+[공유 대화](https://chatgpt.com/share/6abfa690-cae0-83ee-906d-81718968bb90)와 사용자가 제공한 원본 ZIP의 코드·테스트를 검토해 보완했습니다. 기존 음성 별칭, 출력 형식, 속도 범위를 유지하면서 Paseo 설정 예제, Groq 사용량 제한, 지속 사용량 기록, 입력 검증과 테스트를 강화했습니다.
 
-## 1. 무료 사용의 정확한 의미
+음성 전용 서버입니다. LLM의 채팅·Responses API, OpenAI Realtime API, WebSocket 부분 전사는 제공하지 않습니다. 기존 Codex/Claude 등 에이전트 설정은 그대로 사용하고 Paseo의 **음성 설정만** 이 서버로 연결합니다.
 
-2026-10-02 공식 문서 확인 기준입니다. 요금·정책은 변경될 수 있으므로 실제 계정 콘솔을 확인하세요.
+## 빠른 시작
 
-- Groq는 **Free 플랜 조직의 API 키**를 사용하세요. 공개 Whisper 무료 한도는 20 RPM, 2,000 RPD, 시간당 음성 7,200초, 하루 28,800초입니다. 실제 조직 한도가 우선입니다. 이 서버는 API 키만으로 플랜을 검증하거나 Developer 플랜을 Free로 바꾸지 못합니다.
-- Google Cloud TTS는 **결제 계정 활성화가 필요**합니다. WaveNet 공개 무료 구간은 월 400만 자이고 초과분은 유료입니다. Standard와 WaveNet은 공개 가격표의 SKU가 같으므로 둘을 사용한다고 무료량이 각각 추가된다고 가정하지 마세요. Gemini / AI Studio API 키를 넣는 구성이 아닙니다.
-- Google 사용량을 로컬 SQLite에 예약 기록합니다. 기본값은 **최근 32일 350만 단위 / 최근 24시간 15만 단위**입니다. 달 경계와 타임존의 차이를 보수적으로 처리하려고 달력 월 대신 rolling window를 사용합니다. 일반 한글은 1자=1단위, 일부 보조 Unicode 문자는 보수적으로 2단위로 셉니다.
-- 한도를 넘으면 **상위 API를 호출하기 전에 429로 차단**합니다. 유료 모델·다른 제공자로 자동 전환하지 않습니다. 요청 재전송도 하지 않습니다. 다만 Google 인증 토큰 취득 과정에는 인증 라이브러리 자체 처리가 있을 수 있습니다.
-- 타임아웃·부분 합성 실패도 예약량을 환급하지 않습니다. 실패했다고 해서 제공자가 처리하거나 과금하지 않았다고 확정할 수 없기 때문입니다. `/usage`는 실제 청구량이 아니라 **보수적 로컬 예약량**입니다.
-- **완전한 무과금 보증은 아닙니다.** 다른 앱/다른 인스턴스/같은 과금 범위의 다른 프로젝트 사용량, 기존에 쓴 무료량, 과금 정책 변경을 알 수 없습니다. 처음 시작할 때 이미 무료량을 사용했다면 그만큼 더 낮게 설정하세요. 전용 프로젝트·자격 증명으로 이 서버에 사용을 모으고 Cloud Billing도 확인하세요.
-- `speech-data` Docker volume이나 `data/usage.sqlite3`를 삭제하면 로컬 사용량 기록을 잃습니다. `docker compose down -v`를 실행하지 마세요. 독립 DB로 복제한 여러 서버를 함께 사용하지 마세요. 단일 호스트의 같은 DB를 공유한 프로세스에서는 예약을 원자적으로 처리하지만, 이 배포는 1개 인스턴스를 기준으로 합니다.
-- Google의 **알림 전용 budget은 사용 중단 장치가 아닙니다.** 지원 서비스에 대한 spend-cap 기능 존재 여부와 적용 범위는 계정 콘솔에서 별도로 확인하세요.
-
-공식 근거:
-
-- Groq ASR: https://console.groq.com/docs/speech-to-text
-- Groq 한도: https://console.groq.com/docs/rate-limits
-- Google 가격·결제: https://cloud.google.com/text-to-speech/pricing
-- Google 예산: https://docs.cloud.google.com/billing/docs/how-to/budgets
-
-## 2. 구현 범위
-
-| 기능 | 이 서버의 동작 |
-|---|---|
-| `POST /v1/audio/transcriptions` | OpenAI 형태의 multipart upload → Groq |
-| ASR model | `whisper-1`, `whisper-large-v3-turbo` 모두 Groq Turbo로 매핑 |
-| ASR language | 기본 `ko`; `en` 등 2자리 코드 지원; `auto`는 이 서버의 언어 자동 감지 확장값 |
-| ASR 형식 | `json`, `text`, `verbose_json`; `srt`, `vtt`는 실제 segment 타임스탬프를 변환 |
-| ASR timestamp | `timestamp_granularities[]`의 `word`, `segment`; `verbose_json`에서만 |
-| ASR prompt, temperature | Groq에 전달. prompt는 upstream의 224토큰 제한이 적용됨 |
-| ASR 파일 | 최대 25,000,000바이트; flac/mp3/mp4/mpeg/mpga/m4a/ogg/wav/webm |
-| `POST /v1/audio/speech` | OpenAI 형태의 JSON → Google 합성 → 오디오 바이너리 |
-| TTS model | `tts-1`, `google-wavenet` 모두 Google 한국어 WaveNet |
-| TTS voice | OpenAI식 별칭 또는 `ko-KR-Wavenet-A/B/C/D` 직접 지정 |
-| TTS 출력 | mp3, opus(Ogg container), aac(ADTS), flac, wav, pcm |
-| PCM | 24kHz, mono, signed 16-bit little-endian, 헤더 없음 |
-| TTS speed | 0.25–2.0은 Google speakingRate; 2.0 초과–4.0은 추가 FFmpeg atempo 적용 |
-| 한국어 장문 | 최대 4,096자; 4,500 UTF-8바이트 이하로 분할하고 PCM을 병합 후 1개 파일로 인코딩 |
-| `GET /v1/models` | 사용 가능한 로컬 호환 model ID 목록 |
-| `GET /v1/voices` | 음성 매핑 목록. 이 서버 자체 확장 엔드포인트 |
-| `GET /usage` | Bearer 인증이 필요한 로컬 예약 사용량 |
-| `GET /health` | 프로세스 응답 확인만. 실제 upstream 인증/통신 성공 여부는 검사하지 않음 |
-
-**지원하지 않음:** Realtime/WebSocket/WebRTC, ASR 실시간 부분 전사·화자 분리, 음성 번역 API, 자연어 `instructions`, SSE, OpenAI 음성 복제, Chat Completions/Responses. 지원하지 않는 옵션은 조용히 무시하지 않고 400을 반환합니다. `tts-1-hd`, GPT 계열 ASR/TTS model ID도 거부합니다.
-
-`with_streaming_response`처럼 바이너리 HTTP 응답을 스트림으로 읽는 클라이언트와 사용할 수 있는 응답 형태이지만, **전체 합성이 끝난 후 응답**합니다. 음성을 생성하면서 즉시 첫 오디오 청크를 내보내는 실시간 합성은 아닙니다. 긴 입력은 합성/인코딩 시간이 길어지고 분할 경계에서 억양이 끊길 수 있습니다.
-
-이 구현은 개인 음성 명령/짧은 답변 낭독용입니다. 공개 다중 사용자 SaaS, 대규모 업로드, 길고 느린 장문 낭독의 부하 테스트는 하지 않았습니다.
-
-API 규격 근거:
-
-- OpenAI speech: https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create
-- OpenAI transcription: https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create
-- Google 합성: https://docs.cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize
-- Google 5,000바이트 제한: https://docs.cloud.google.com/text-to-speech/quotas
-- Google 속도/포맷: https://docs.cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
-- 한국어 음성: https://docs.cloud.google.com/text-to-speech/docs/list-voices-and-types
-
-## 3. 준비
-
-Groq API 키와 Google 자격 증명은 **서버에만** 두고, 클라이언트에는 이 서버의 `PROXY_API_KEY`만 넣습니다. 키나 Google JSON 내용을 채팅에 올리지 마세요.
+필요한 것은 Python 3.12와 FFmpeg 또는 Docker Compose, Groq API 키, Google Cloud 프로젝트와 ADC 자격 증명입니다. Google AI Studio/Gemini API 키로는 이 구현에 인증할 수 없습니다.
 
 ```bash
-cd korean-speech-openai
+git clone https://github.com/RunaticMoon/korean-speach-openai.git
+cd korean-speach-openai
 cp .env.example .env
 chmod 600 .env
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-출력된 난수를 `.env`의 `PROXY_API_KEY`에 넣고, `GROQ_API_KEY`, `GOOGLE_CLOUD_PROJECT`를 채우세요. 기본값은 `ko-KR-Wavenet-A`, `127.0.0.1:8787`입니다.
+출력한 난수를 `.env`의 `PROXY_API_KEY`에 넣고 나머지 값을 채웁니다. `PROXY_API_KEY`는 최소 32자이며, 클라이언트와 브리지 사이에서 쓰는 별도의 키입니다. Groq 키와 Google 자격 증명은 Paseo에 입력하지 않습니다.
 
-### Google 자격 증명: 로컬 시험용 ADC
+```dotenv
+PROXY_API_KEY=여기에_직접_생성한_32자_이상의_난수
+GROQ_API_KEY=본인의_Groq_API_키
+GROQ_FREE_TIER_CONFIRMED=true
+GOOGLE_CLOUD_PROJECT=본인의_Google_Cloud_프로젝트_ID
+GOOGLE_APPLICATION_CREDENTIALS=./secrets/google-adc.json
+```
 
-Google Cloud 프로젝트를 만들거나 본인이 관리하는 프로젝트를 선택하고, Cloud Billing 연결과 Cloud Text-to-Speech API 활성화를 먼저 완료하세요. Google Cloud CLI가 설치된 로컬 Mac/Linux에서 아래를 실행합니다. **해당 프로젝트 설정을 변경할 권한이 필요**하며 CLI 인증과 앱용 ADC 인증은 별개입니다.
+**Groq 콘솔에서 해당 키의 조직이 Free 플랜인지 직접 확인한 뒤에만** `GROQ_FREE_TIER_CONFIRMED=true`로 설정합니다. 이 설정은 사용자 확인을 기록할 뿐 계정 플랜을 조회하거나 무료 플랜으로 전환하지 않습니다. 서버의 자체 한도와 별도로 실제 계정의 [Groq Limits](https://console.groq.com/settings/limits)가 적용됩니다.
+
+### Google Cloud 인증
+
+프로젝트에 결제를 연결하고 Cloud Text-to-Speech API를 활성화합니다. 로컬 개발용 사용자 ADC는 다음과 같이 준비할 수 있습니다.
 
 ```bash
-export PROJECT_ID='실제-google-cloud-project-id'
 gcloud auth login
-gcloud config set project "$PROJECT_ID"
-gcloud services enable texttospeech.googleapis.com --project="$PROJECT_ID"
+gcloud services enable texttospeech.googleapis.com --project=YOUR_PROJECT_ID
 gcloud auth application-default login
-gcloud auth application-default set-quota-project "$PROJECT_ID"
-
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
 mkdir -p secrets
 chmod 700 secrets
-cp "$(gcloud info --format='value(config.paths.global_config_dir)')/application_default_credentials.json" \
-  secrets/google-adc.json
+```
+
+`application-default login`이 출력하는 ADC 파일을 `secrets/google-adc.json`으로 복사합니다. Linux/macOS의 기본 경로를 사용하는 경우:
+
+```bash
+cp "$HOME/.config/gcloud/application_default_credentials.json" secrets/google-adc.json
 chmod 600 secrets/google-adc.json
 ```
 
-`set-quota-project`에서 권한 오류가 발생하면 해당 ADC 사용자에게 quota project의 `serviceusage.services.use` 권한이 있는지 관리자에게 확인하세요. 개인 프로젝트라면 프로젝트 소유자 계정으로 시작하고, 상시 운영 권한은 최소화하세요.
+`YOUR_PROJECT_ID`와 `.env`의 `GOOGLE_CLOUD_PROJECT`는 실제 프로젝트 ID로 바꿉니다. 사용자에게 해당 프로젝트의 API 사용 권한이 있어야 합니다. 다른 클라우드에서 상시 운영할 때는 전용 자격 증명과 Workload Identity Federation 등 운영 환경에 맞는 ADC 구성을 사용합니다. 설정 파일이 외부 토큰 파일을 참조한다면 그 파일도 컨테이너에서 접근할 수 있어야 합니다. [Google TTS 인증](https://docs.cloud.google.com/text-to-speech/docs/authentication), [환경별 ADC 설정](https://docs.cloud.google.com/docs/authentication/provide-credentials-adc).
 
-이 파일에는 refresh token 등 민감한 자격 증명이 들어갑니다. 위 로그인 방식은 **로컬 개발/시험용**입니다. OCI에 상시 운영할 때는 개인 사용자 ADC를 계속 복제하기보다 전용 서비스 계정 또는 Workload Identity Federation으로 분리하세요. 앱 코드는 Google ADC를 사용하므로 서비스 계정 키 JSON이나 ADC용 외부 계정 구성도 읽을 수 있습니다. 다만 WIF 구성에서 참조하는 외부 토큰 파일/실행 명령은 별도로 컨테이너에 제공해야 합니다. 서비스 계정 키를 사용할 경우 최소 권한·보관·주기적 교체가 필요하며, 조직에서 키 발급을 금지했다면 정책을 우회하지 마세요.
+ADC 탐색과 토큰 갱신은 실제 TTS 요청 시 수행됩니다. `/health` 또는 `/ready` 성공만으로 Google의 권한·결제·네트워크 연결까지 확인된 것은 아닙니다.
 
-Google 공식 인증 문서:
+### Docker Compose 실행
 
-- https://docs.cloud.google.com/docs/authentication/provide-credentials-adc
-- https://docs.cloud.google.com/text-to-speech/docs/authentication
-
-## 4. 실행: Docker Compose
-
-Docker Engine와 `docker compose`가 설치된 Ubuntu 또는 Docker Desktop이 있는 Mac을 전제로 합니다. Dockerfile은 특정 CPU 아키텍처를 강제하지 않지만, **실제 OCI ARM 이미지 빌드는 이 패키지 작성 환경에서 검증하지 못했습니다**.
-
-컨테이너는 root가 아닌 UID 10001로 실행합니다. 자격 증명은 **파일 하나만** read-only bind mount 합니다. 간단한 개인 환경에서는 호스트의 `secrets` 디렉터리를 소유자만 접근 가능하게 두고, 그 안의 파일은 컨테이너 사용자도 읽을 수 있게 설정합니다.
+컨테이너는 **UID/GID 10001**로 실행됩니다. `secrets/google-adc.json`은 읽기 전용으로 마운트하며 이 UID가 읽을 수 있어야 합니다. 일반적인 Linux Docker에서는 ACL로 해당 UID에만 읽기 권한을 줄 수 있습니다.
 
 ```bash
-chmod 700 secrets
-chmod 444 secrets/google-adc.json
-# 파일 읽기 권한을 넓히는 대신, 부모 secrets 디렉터리의 700 보호를 반드시 유지하세요.
-# 디렉터리를 공유하거나 공개 저장소/동기화 폴더에 넣지 마세요.
-
-docker compose up -d --build
-docker compose logs --tail=50 speech-api
-curl -f http://127.0.0.1:8787/health
-```
-
-보안 정책상 `0444` 파일 모드를 허용하지 않으면 UID 10001 소유의 `0400` 파일이나 접근이 제한된 호스트 ACL을 사용하세요. 단순히 `chmod 600`을 적용한 본인 소유 파일은 컨테이너 UID 10001이 읽지 못할 수 있습니다.
-
-데이터는 named volume `speech-data`에 유지됩니다. 업데이트는 같은 프로젝트 디렉터리에서 `docker compose up -d --build`로 실행하세요. `down -v`로 volume을 삭제하지 마세요. `.env` 변경은 컨테이너 재생성이 필요합니다.
-
-읽기 전용 root filesystem, root 권한 제거, 메모리/프로세스 제한을 사용합니다. `/tmp`는 메모리 기반이며 multipart 임시 파일이 여기로 갈 수 있습니다. TTS 캐시도 프로세스 메모리에만 저장합니다. SQLite에는 시간과 예약 문자 단위 수만 남습니다.
-
-### OCI + Tailscale
-
-해당 호스트의 Tailscale IPv4를 확인해서 `.env`의 `BIND_IP`에 직접 넣습니다. 이전에 사용하던 주소를 그대로 가정하지 마세요.
-
-```bash
-tailscale ip -4
-# .env를 편집: BIND_IP=실제-100.x-주소
+# Linux에서 필요하면 먼저 배포판의 acl 패키지를 설치합니다.
+setfacl -m u:10001:r secrets/google-adc.json
+docker compose build
+docker compose run --rm --no-deps speech-api python -c \
+  'from pathlib import Path; assert Path("/run/secrets/google-adc.json").is_file(); Path("/run/secrets/google-adc.json").open("rb").close(); print("ADC readable")'
 docker compose up -d
+docker compose logs --tail=50 speech-api
+curl --fail http://127.0.0.1:8787/health
 ```
 
-다른 Tailnet 기기의 음성용 base URL은 `http://100.x.x.x:8787/v1`입니다. 서버의 Tailscale 주소가 먼저 준비되어 있어야 Docker가 해당 주소에 bind할 수 있습니다. 외부 공개 IP의 8787 포트는 열지 마세요. 공용 인터넷을 사용해야 하는 구성은 TLS·접근 제어·요청 제한을 갖춘 별도 reverse proxy를 구성해야 하며 이 패키지에는 포함하지 않았습니다.
+Docker Desktop의 파일 공유 방식이나 rootless/user namespace 설정에서는 UID 매핑이 다를 수 있습니다. 위 읽기 확인이 실패하면 해당 환경의 파일 공유 권한을 조정합니다. 자격 증명을 모두에게 읽기 가능하게 만들거나 로그에 출력하지 않습니다.
 
-## 5. Docker 없이 Mac / Ubuntu에서 실행
+Compose는 호스트의 `.env`를 읽되 ADC 경로를 `/run/secrets/google-adc.json`, 사용량 DB 경로를 `/app/data/usage.sqlite3`으로 덮어씁니다. 명명된 `speech-data` 볼륨은 처음 생성할 때 이미지의 UID 10001 소유 디렉터리로 초기화됩니다. 이미 다른 UID로 생성한 볼륨을 재사용한다면 기존 데이터를 보존한 채 소유권을 맞춰야 합니다.
 
-Python 3.12 이상과 FFmpeg를 설치한 뒤:
+컨테이너 루트 파일시스템은 읽기 전용이며 업로드 처리용 `/tmp`는 128MiB tmpfs입니다. 기본 메모리 한도는 768MiB, 프로세스 한도는 128, worker는 1개입니다. SQLite 볼륨만 지속적으로 쓰며 성공 오디오 캐시는 메모리에 있습니다. 장문·동시 요청에 맞춰 한도를 높일 때는 호스트의 여유 자원도 함께 확인합니다.
+
+기본 공개 주소는 `127.0.0.1:8787`입니다. 원격 Paseo daemon에서 접근해야 한다면 `.env`의 `BIND_IP`를 해당 서버의 Tailscale/VPN 주소로 바꾸고 서버를 재생성합니다. `PORT`는 호스트 포트이며 컨테이너 내부 포트는 8787입니다. 인터넷에 직접 노출할 때는 HTTPS와 접근 제한을 별도로 구성해야 합니다.
+
+### Python으로 직접 실행
+
+Ubuntu/Debian에서는 `sudo apt-get install ffmpeg`로 FFmpeg와 ffprobe를 설치합니다. 다른 OS에서는 사용하는 패키지 관리자로 설치한 뒤 두 실행 파일이 `PATH`에 있는지 확인합니다.
 
 ```bash
-# Ubuntu 예: sudo apt-get update && sudo apt-get install -y python3-venv ffmpeg
-# Mac 예: brew install python ffmpeg
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-chmod 600 secrets/google-adc.json
-./scripts/run-local.sh
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+uvicorn speech_proxy.app:app --host 127.0.0.1 --port 8787
 ```
 
-`run-local.sh`는 본인이 작성한 `.env`를 shell로 읽습니다. 신뢰할 수 없는 사람이 만든 `.env`를 사용하지 마세요. 로컬 실행의 DATA_DIR은 `./data`, Docker 실행의 DATA_DIR은 named volume으로 고정됩니다. 둘을 동시에 사용하면 별도 원장이 되므로 무료량을 공동으로 관리하지 못합니다.
+프로젝트 루트에서 실행하면 `.env` 설정을 읽습니다. 직접 실행할 때는 ADC 파일과 `data/` 디렉터리에 현재 사용자의 읽기·쓰기 권한이 있어야 합니다. `USAGE_DB_PATH`의 부모 디렉터리는 자동 생성됩니다.
 
-## 6. 앱 연결값
+`.env`의 `BIND_IP`와 `PORT`까지 적용하려면 `./scripts/run-local.sh`를 실행합니다. 원본의 `uvicorn app.main:create_app --factory` 진입점도 유지합니다.
 
-```text
-음성 ASR/TTS Base URL: http://127.0.0.1:8787/v1
-음성 API Key:         .env의 PROXY_API_KEY
-ASR Model:            whisper-1
-TTS Model:            tts-1
-TTS Voice:            alloy
-Language:             ko
+### 원본 ZIP에서 업데이트
+
+기존 `.env`, `secrets/google-adc.json`, `data/usage.sqlite3` 또는 `speech-data` 볼륨을 보존합니다. 새 설정 중 `GROQ_FREE_TIER_CONFIRMED=true`는 Free 플랜을 직접 확인한 뒤 추가해야 합니다. 기존 `TTS_ROLLING_32D_CHAR_LIMIT`, `TTS_ROLLING_24H_CHAR_LIMIT`, `TTS_CACHE_MAX_BYTES`, `TTS_CACHE_TTL_SECONDS`, `DATA_DIR`, `ASR_DEFAULT_LANGUAGE`도 호환되며 새 배포에는 `.env.example`의 표준 이름을 권장합니다.
+
+기존 DB의 TTS `reservations` 기록은 새 사용량 원장에 한 번만 가져옵니다. 기존 테이블은 보존합니다. 업데이트 전 DB를 백업하고 기존 프로세스를 중지한 뒤 새 버전을 시작합니다. 구버전과 신버전을 동시에 실행하면 가져오기 이후의 구버전 예약이 새 원장에 반영되지 않으므로 함께 실행하지 않습니다. Python 직접 실행과 Compose가 서로 다른 DB를 사용하지 않는지도 확인합니다.
+
+## Paseo 연결
+
+설정 대상은 휴대폰·데스크톱 UI가 아니라 **실제로 실행 중인 Paseo daemon의 설정 파일**입니다. 기본 위치는 `~/.paseo/config.json`이며 `PASEO_HOME`을 변경했다면 그 홈을 사용합니다.
+
+[examples/paseo.config.json](examples/paseo.config.json)의 내용을 기존 설정에 병합하고 `REPLACE_WITH_YOUR_PROXY_API_KEY` 두 곳을 `.env`의 `PROXY_API_KEY`로 바꿉니다. 기존 `agents`, `daemon`, `features.voiceMode.llm` 등의 설정을 덮어쓰지 않습니다.
+
+```json
+{
+  "version": 1,
+  "features": {
+    "dictation": {
+      "stt": {"provider": "openai", "model": "whisper-1", "language": "ko"}
+    },
+    "voiceMode": {
+      "stt": {"provider": "openai", "model": "whisper-1", "language": "ko"},
+      "tts": {"provider": "openai", "model": "tts-1", "voice": "alloy"}
+    }
+  },
+  "providers": {
+    "openai": {
+      "stt": {
+        "apiKey": "REPLACE_WITH_YOUR_PROXY_API_KEY",
+        "baseUrl": "http://127.0.0.1:8787/v1"
+      },
+      "tts": {
+        "apiKey": "REPLACE_WITH_YOUR_PROXY_API_KEY",
+        "baseUrl": "http://127.0.0.1:8787/v1"
+      }
+    }
+  }
+}
 ```
 
-앱이 ASR/TTS 엔드포인트 전체를 요구하면 각각 `/v1/audio/transcriptions`, `/v1/audio/speech`까지 넣으세요. **LLM base URL까지 이 주소로 바꾸면 채팅 기능은 404가 납니다.** 음성용 base URL을 따로 설정할 수 있는 클라이언트에 연결하세요. 브라우저 직접 호출용 CORS는 기본으로 켜지 않았습니다. 브라우저 앱이면 같은 출처의 백엔드에서 중계하고 키를 공개 프런트엔드에 하드코딩하지 않는 구성이 적합합니다.
+- `baseUrl`은 **Paseo daemon에서 접근 가능한 주소**이며 `/v1`을 한 번 포함합니다. 두 서버가 다른 머신에 있으면 `127.0.0.1` 대신 브리지 서버의 주소를 씁니다. Paseo 자체가 컨테이너에 있으면 그 컨테이너의 `127.0.0.1`은 브리지가 아닙니다.
+- `providers.openai.stt`/`tts`는 음성 전용 설정입니다. 기존 LLM의 `OPENAI_BASE_URL`을 이 주소로 바꾸지 않습니다.
+- 받아쓰기와 음성 대화의 언어를 모두 `ko`로 설정합니다. Paseo 기본 언어는 `en`입니다.
+- Paseo에는 TTS 모델 `tts-1`, 음성 `alloy` 등 OpenAI 별칭을 입력합니다. Google 음성 ID를 Paseo의 `voice` 필드에 직접 넣으면 Paseo의 설정 검증에서 거절됩니다.
+- Paseo의 PCM 요청에는 **24kHz, mono, signed 16-bit little-endian, 헤더 없는 PCM**을 반환합니다. WAV/MP3 바이트를 PCM으로 반환하지 않습니다.
 
-기본 음성 매핑:
+설정 적용은 진행 중인 에이전트 작업이 끝난 뒤 수행합니다. 직접 파일을 편집한 경우 `paseo reload`로 검증할 수 있지만 **음성·자격 증명 변경은 daemon 재시작이 필요합니다**. CLI 관리 daemon은 `paseo daemon restart`를 사용하고, Desktop 관리 daemon은 해당 Desktop의 관리 방식으로 다시 시작합니다. Docker 배포는 해당 컨테이너를 다시 시작합니다. 이 저장소의 설치 과정은 Paseo 설정을 자동 수정하거나 daemon을 재시작하지 않습니다.
 
-| client voice | Google voice |
+Managed start/Desktop에서는 상속된 daemon 환경변수를 제거할 수 있으므로 음성 설정을 `config.json`에 저장합니다. 현재 계약은 [Paseo Voice](https://paseo.sh/docs/voice.md)와 [Configuration](https://paseo.sh/docs/configuration.md)을 기준으로 하며, 설치된 Paseo 버전이 오래되었다면 별도 STT/TTS 주소 설정 지원 여부를 확인합니다.
+
+## API와 사용 예제
+
+`GET /health`만 인증 없이 호출할 수 있습니다. `/v1/*`, `/usage`, `/ready`에는 `Authorization: Bearer <PROXY_API_KEY>`가 필요합니다.
+
+| 메서드·경로 | 동작 |
 |---|---|
-| alloy | `GOOGLE_TTS_VOICE` 환경변수, 기본 ko-KR-Wavenet-A |
-| nova / marin | ko-KR-Wavenet-A |
-| shimmer / coral / sage | ko-KR-Wavenet-B |
-| echo / fable / ash / ballad | ko-KR-Wavenet-C |
-| onyx / verse / cedar | ko-KR-Wavenet-D |
+| `GET /health` | 프로세스 생존 확인. 외부 API를 호출하지 않음 |
+| `GET /ready` | 설정 준비 상태. 외부 API나 Google 토큰 발급을 시험하지 않음 |
+| `GET /usage` | SQLite에 기록된 예약 사용량과 한도 조회 |
+| `GET /v1/models` | 지원하는 호환 모델 목록 |
+| `GET /v1/voices` | OpenAI 별칭과 Google 음성 매핑. 이 서버의 확장 API |
+| `POST /v1/audio/transcriptions` | multipart 음성 인식 |
+| `POST /v1/audio/speech` | JSON 텍스트 입력을 음성으로 변환 |
 
-Google 공식 목록상 A/B는 FEMALE, C/D는 MALE 표기입니다. 이는 OpenAI 원래 음성과 비슷하다는 뜻이 아닙니다.
-
-## 7. 실제 연결 테스트
-
-본인의 `.env`를 shell에 읽어 넣습니다. 아래 테스트는 실제 상위 API를 호출하므로 무료 한도 내 사용량에 포함됩니다.
+SDK 예제를 실행하려면 개발 의존성을 설치합니다. [examples/client.py](examples/client.py)는 `.env`를 읽으며 재시도에 따른 중복 사용량을 줄이기 위해 `max_retries=0`을 지정합니다.
 
 ```bash
-set -a; source .env; set +a
-export SPEECH_BASE_URL="http://${BIND_IP}:${PORT}/v1"
+python -m pip install -r requirements-dev.txt
+python examples/client.py transcribe recording.wav
+python examples/client.py speak '안녕하세요. 한국어 음성 연결 테스트입니다.' --output speech.mp3
+python examples/client.py speak 'PCM 테스트입니다.' --format pcm --output speech.pcm
+```
 
-# 모델 목록: 외부 API 호출 없음
-curl -fsS "$SPEECH_BASE_URL/models" \
-  -H "Authorization: Bearer $PROXY_API_KEY"
+다른 서버를 지정할 때는 `python examples/client.py --base-url http://SERVER:8787/v1 speak '안녕하세요'`처럼 공통 옵션을 하위 명령 앞에 둡니다. 직접 API 호출 예시:
 
-# 음성 인식: 실제 녹음 파일로 바꾸기
-curl --fail-with-body "$SPEECH_BASE_URL/audio/transcriptions" \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -F model=whisper-1 -F language=ko -F file=@recording.wav
-
-# 음성 합성: HTTP 오류 시 오디오 파일로 오인하지 않도록 -f 사용
-curl -fS "$SPEECH_BASE_URL/audio/speech" \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
+```bash
+# 별도 셸에서 설정합니다. .env 내용 전체를 출력하지 않습니다.
+read -r -s -p 'PROXY_API_KEY: ' PROXY_API_KEY
+export PROXY_API_KEY
+curl --fail-with-body http://127.0.0.1:8787/ready \
+  -H "Authorization: Bearer ${PROXY_API_KEY}"
+curl --fail-with-body http://127.0.0.1:8787/usage \
+  -H "Authorization: Bearer ${PROXY_API_KEY}"
+curl --fail-with-body http://127.0.0.1:8787/v1/audio/transcriptions \
+  -H "Authorization: Bearer ${PROXY_API_KEY}" \
+  -F file=@recording.wav -F model=whisper-1 -F language=ko
+curl --fail-with-body http://127.0.0.1:8787/v1/audio/speech \
+  -H "Authorization: Bearer ${PROXY_API_KEY}" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"tts-1","voice":"alloy","input":"안녕하세요. 한국어 음성 테스트입니다.","response_format":"mp3"}' \
-  -o speech.mp3
-
-# Mac: afplay speech.mp3
-# FFmpeg 설치 환경: ffplay -autoexit speech.mp3
-
-curl -fsS "http://${BIND_IP}:${PORT}/usage" \
-  -H "Authorization: Bearer $PROXY_API_KEY"
+  -d '{"model":"tts-1","voice":"alloy","input":"안녕하세요.","response_format":"wav"}' \
+  --output speech.wav
 ```
 
-OpenAI Python SDK 예시는 `examples/client.py`에 있습니다. 별도 SDK 설치:
+### 지원 범위
+
+| 항목 | 지원 |
+|---|---|
+| STT 모델 | `whisper-1` → `GROQ_MODEL`로 설정한 모델, 기본 Turbo; `whisper-large-v3-turbo`, `whisper-large-v3` 직접 지정 가능 |
+| STT 언어 | 기본 `ko`; `ASR_DEFAULT_LANGUAGE`로 변경, `auto`는 자동 감지 확장값 |
+| STT 응답 | `json`, `text`, `verbose_json`, `srt`, `vtt` |
+| TTS 모델 | `tts-1`, `tts-1-hd`, `google-wavenet` → 동일 Google 합성 경로 |
+| TTS 형식 | `mp3`, `wav`, `pcm`, `opus`, `aac`, `flac` |
+| TTS `speed` | `0.25`–`4.0`. `2.0` 초과는 Google 속도 `2.0`에 FFmpeg `atempo` 추가 적용 |
+| TTS 입력 | 기본 최대 20,000자, 한국어 장문 UTF-8 바이트 단위 분할 |
+
+Groq가 직접 제공하는 전사 형식은 `json`, `text`, `verbose_json`입니다. 이 서버의 `srt`/`vtt`는 Groq의 `verbose_json` segment 타임스탬프를 이용해 로컬에서 생성합니다. [Groq STT 문서](https://console.groq.com/docs/speech-to-text).
+
+Google TTS 입력은 UTF-8 4,500바이트 이하로 분할하여 각 조각을 합성하고 PCM으로 결합합니다. 결과는 FFmpeg로 요청한 실제 컨테이너/코덱으로 변환합니다. `opus`는 Ogg/Opus, `aac`는 ADTS AAC입니다. `pcm`에는 WAV 헤더가 없으며 다른 형식은 해당 파일 형식으로 반환됩니다. 서버는 전체 합성과 변환을 마친 뒤 응답하므로 SDK의 `with_streaming_response`를 사용해도 생성 중 저지연 스트리밍은 아닙니다.
+
+| 요청 `voice` | Google 음성 |
+|---|---|
+| `alloy` | `GOOGLE_TTS_VOICE` 값, 기본 `ko-KR-Wavenet-A` |
+| `nova`, `marin` | `ko-KR-Wavenet-A` |
+| `shimmer`, `coral`, `sage` | `ko-KR-Wavenet-B` |
+| `echo`, `fable`, `ash`, `ballad` | `ko-KR-Wavenet-C` |
+| `onyx`, `verse`, `cedar` | `ko-KR-Wavenet-D` |
+
+브리지에 직접 요청할 때는 `ko-KR-Standard-A`–`D`, `ko-KR-Wavenet-A`–`D`도 허용합니다. 허용 목록 밖의 음성으로 자동 변경하지 않습니다. 별칭은 요청 형식을 맞추기 위한 것이며 OpenAI의 실제 목소리나 `tts-1-hd` 음질을 재현한다는 의미가 아닙니다.
+
+## 사용량 제한과 운영
+
+사용량은 외부 호출 전에 SQLite 트랜잭션으로 예약합니다. 같은 로컬 DB 파일을 공유하는 프로세스들은 합산된 한도를 적용받습니다. TTS는 원본과 동일하게 UTF-16 단위를 사용하므로 일반 한글은 1, 일부 보조 Unicode 문자·이모지는 2로 셉니다. `/usage`는 실제 청구량이 아닌 보수적인 예약량입니다. 실패·타임아웃·취소 후에는 공급자가 처리했을 가능성이 있으므로 예약량을 환급하지 않습니다. 사용량 DB가 쓰기 불가능하면 우회 호출하지 않습니다.
+
+| 환경변수 | 기본값 | 의미 |
+|---|---:|---|
+| `TTS_32DAY_CHAR_LIMIT` | `3500000` | 최근 32일 TTS 문자 예약 상한 |
+| `TTS_DAILY_CHAR_LIMIT` | `150000` | 최근 24시간 TTS 문자 예약 상한 |
+| `GROQ_MINUTE_REQUEST_LIMIT` | `20` | 최근 60초 전사 요청 상한 |
+| `GROQ_DAILY_REQUEST_LIMIT` | `2000` | 최근 24시간 전사 요청 상한 |
+| `GROQ_HOURLY_AUDIO_SECONDS_LIMIT` | `7200` | 최근 1시간 음성 초 예약 상한 |
+| `GROQ_DAILY_AUDIO_SECONDS_LIMIT` | `28800` | 최근 24시간 음성 초 예약 상한 |
+| `MAX_AUDIO_SECONDS` | `600` | 업로드 한 건의 최대 음성 길이 |
+| `MAX_TTS_INPUT_CHARS` | `20000` | 한 건의 최대 TTS 입력 문자 수 |
+| `CACHE_MAX_BYTES` | `33554432` | 프로세스당 성공 PCM 메모리 캐시 최대 바이트 |
+| `CACHE_TTL_SECONDS` | `3600` | 성공 PCM 캐시 유지 시간 |
+| `USAGE_DB_PATH` | `data/usage.sqlite3` | 직접 실행 시 사용량 DB 경로 |
+
+기본 상한은 공급자의 공식 무료 한도를 보장하거나 실시간 동기화하는 값이 아닙니다. 한도를 넘으면 외부 요청 전에 `429`를 반환하며 유료 모델로 자동 전환하지 않습니다. 동일 요청의 성공 PCM이 캐시에 있으면 외부 합성 및 사용량 예약을 생략합니다. 캐시는 프로세스마다 별도이며 재시작하면 사라집니다. 여러 worker 또는 여러 서버의 캐시를 공유하지 않습니다.
+
+사용량 한도 `0`은 해당 공급자 호출 차단을 뜻하며 무제한 설정이 아닙니다. `TTS_32DAY_CHAR_LIMIT`는 최대 350만 단위까지 허용합니다. Groq 음성 길이는 파일 메타데이터만 신뢰하지 않고 디코딩한 뒤 측정하며, 요청마다 최소 10초를 예약하고 그 이상은 초 단위로 올림합니다. 짧은 받아쓰기 여러 건도 각각 최소 예약량을 사용합니다. 캐시를 끄려면 `CACHE_MAX_BYTES=0`으로 설정합니다.
+
+**무과금을 보장하지 않습니다.** 이 서버는 같은 Google 결제 계정·Groq 조직에서 다른 앱이나 서버가 쓴 사용량을 알 수 없습니다. 이전 사용량, 공급자의 과금 단위·정책 변경도 따로 확인해야 합니다. 자신의 [Google TTS 가격](https://cloud.google.com/text-to-speech/pricing)과 [Groq 한도](https://console.groq.com/docs/rate-limits)를 확인하고 필요하면 자체 상한을 더 낮춥니다.
+
+DB는 로컬 디스크에 보관합니다. SQLite 파일을 NFS 같은 네트워크 파일시스템으로 공유하거나 서로 다른 DB를 쓰는 복제 서버에서 계정 전체 한도가 합산된다고 가정하지 않습니다. `speech-data` 볼륨이나 DB를 지우면 예약 기록도 사라지므로 **`docker compose down -v`로 볼륨을 삭제하지 마세요.** 백업은 SQLite backup API 또는 서버를 중지한 상태에서 수행하고 WAL 파일만 누락한 단순 복사는 피합니다.
+
+키, ADC 파일, 실제 녹음, 생성 음성을 저장소에 올리지 않습니다. 공유 인증키 하나를 사용하는 개인용 배포를 기본 대상으로 하며 사용자별 과금·권한 분리는 제공하지 않습니다.
+
+음성 인식 요청의 multipart 파싱과 디코딩 검증에는 임시 오디오 파일이 사용될 수 있으며 처리 후 삭제합니다. Compose의 임시 파일은 `/tmp` tmpfs에, Python 직접 실행에서는 OS 임시 디렉터리에 생성됩니다. 영구 녹음 기능은 없으며 사용량 DB에는 시각·공급자·예약 단위가 저장됩니다. 실제 음성·합성 텍스트는 각각 Groq·Google에 전송되므로 해당 공급자의 데이터 정책이 적용됩니다.
+
+## 검증
 
 ```bash
-.venv/bin/pip install 'openai>=1.60,<3'
-PROXY_API_KEY="$PROXY_API_KEY" SPEECH_BASE_URL="$SPEECH_BASE_URL" \
-  .venv/bin/python examples/client.py recording.wav
+python -m pip install -r requirements-dev.txt
+python -m ruff check .
+python -m ruff format --check .
+python -m pytest
+docker build -t korean-speech-openai:test .
 ```
 
-SDK 예제는 `max_retries=0`으로 설정합니다. 일부 SDK/앱은 429/5xx/타임아웃을 기본 재시도하므로, 자동 재시도를 끄거나 제한하세요. 프록시의 메모리 캐시는 성공한 동일 요청을 절약하지만 실패/동시 요청의 exactly-once 실행을 보장하지 않습니다.
+테스트는 공급자 HTTP를 모의 응답으로 대체하고 실제 FFmpeg/ffprobe를 사용합니다. 인증, 입력 검증, 오디오 변환, 한국어 분할, SQLite 사용량 제한, OpenAI SDK 요청/응답 호환성을 검증하는 범위입니다. CI는 Python 3.12에서 검사·테스트, Docker 이미지 빌드, 외부 자격 증명 없이 컨테이너를 시작하는 생존 확인을 수행하도록 구성했습니다.
 
-## 8. 오류 처리 / 운영
+실행 결과와 미검증 범위는 [TEST_REPORT.md](TEST_REPORT.md)에 기록합니다.
 
-| 응답 | 확인할 내용 |
+**실제 Groq/Google API 호출, Google 토큰 발급, Paseo에서 마이크 입력과 스피커 재생까지의 종단 간 연결은 아직 검증하지 않았습니다.** 유효한 사용자 자격 증명을 설정한 뒤 짧은 녹음과 TTS 입력으로 직접 확인해야 합니다. 공유 대화에 기재된 과거 테스트 개수나 배포 성공 여부는 이 저장소의 검증 결과로 간주하지 않습니다.
+
+## 문제 해결
+
+| 증상 | 확인할 내용 |
 |---|---|
-| 401 invalid_api_key | Groq 키가 아닌 로컬 PROXY_API_KEY를 클라이언트에 입력했는지 |
-| 400 unsupported/model/voice | 위 호환 표에 없는 model·voice·옵션인지 |
-| 413 | 파일 25,000,000바이트 또는 전체 request body 제한 초과 |
-| 429 local_tts_limit | `/usage` 확인. 원장을 삭제해서 초기화하지 말 것 |
-| 429 upstream_rate_limit | Groq/Google 계정 한도. 가능하면 Retry-After에 따를 것 |
-| 502 upstream_auth_error | Groq 키 / Google API 활성화·결제·권한·프로젝트 확인 |
-| 503 google_auth_failed | ADC 파일 내용·경로·컨테이너 읽기 권한 확인 |
-| 503 usage_storage_error | SQLite 디렉터리 쓰기 권한·디스크·락 확인. 실패 시 상위 합성 차단 |
-| 504 upstream_timeout | 네트워크/상위 지연. 실패에도 TTS 예약량은 유지됨 |
+| `401` | Paseo/SDK의 키가 `PROXY_API_KEY`와 같은지, Bearer 헤더가 있는지 |
+| 준비 상태 실패 | 필수 키·프로젝트·Groq Free 플랜 확인 설정과 FFmpeg 설치 |
+| Google 인증 실패 | ADC 파일 읽기 권한, API 활성화, quota project, 프로젝트 권한·결제 상태 |
+| `429` | `/usage`의 예약량과 공급자 한도. 재시도마다 사용량이 추가될 수 있음 |
+| 한국어가 영어로 잘못 전사됨 | Paseo dictation과 voiceMode의 `language`가 모두 `ko`인지 |
+| TTS가 잡음이거나 속도가 다름 | 요청 형식 `pcm`과 24kHz PCM 계약, 잘못된 프록시 경로나 오래된 서버 이미지 |
+| Paseo에 연결되지 않음 | daemon에서 브리지 주소 접근 가능 여부, `/v1` 중복·누락, 설정 적용 후 daemon 재시작 |
 
-프록시는 transcript·입력 텍스트·오디오·키를 로그에 기록하지 않습니다. 상위 API에는 실제 음성/텍스트가 전송되므로 각 제공자의 데이터 정책이 적용됩니다. 업로드가 multipart 파서의 메모리 한도를 넘으면 임시 파일로 잠시 기록될 수 있습니다. 제공한 Docker 구성은 `/tmp`를 tmpfs로 사용하지만, Docker 없이 실행하면 OS 임시 디렉터리를 사용합니다. TTS 음성 캐시를 끄려면 `TTS_CACHE_MAX_BYTES=0`을 지정하세요.
-
-검증 결과와 검증하지 못한 범위는 `TEST_REPORT.md`를 확인하세요.
+로그를 공유할 때는 인증키, ADC 내용, 음성·전사 텍스트를 제거합니다.

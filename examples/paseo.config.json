@@ -1,0 +1,37 @@
+{
+  "$schema": "https://paseo.sh/schemas/paseo.config.v1.json",
+  "version": 1,
+  "features": {
+    "dictation": {
+      "stt": {
+        "provider": "openai",
+        "model": "whisper-1",
+        "language": "ko"
+      }
+    },
+    "voiceMode": {
+      "stt": {
+        "provider": "openai",
+        "model": "whisper-1",
+        "language": "ko"
+      },
+      "tts": {
+        "provider": "openai",
+        "model": "tts-1",
+        "voice": "alloy"
+      }
+    }
+  },
+  "providers": {
+    "openai": {
+      "stt": {
+        "apiKey": "REPLACE_WITH_YOUR_PROXY_API_KEY",
+        "baseUrl": "http://127.0.0.1:8787/v1"
+      },
+      "tts": {
+        "apiKey": "REPLACE_WITH_YOUR_PROXY_API_KEY",
+        "baseUrl": "http://127.0.0.1:8787/v1"
+      }
+    }
+  }
+}

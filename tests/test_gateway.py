@@ -1,348 +1,469 @@
-from __future__ import annotations
-
 import asyncio
 import base64
 import io
 import json
 import math
 import struct
-import threading
 import wave
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from contextlib import asynccontextmanager
+from email import policy
 from email.parser import BytesParser
-from email.policy import default
+from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 
-from app.core import APIError, AudioCache, Settings, UsageLedger, WINDOW_SECONDS, count_units
-from app.main import create_app
-from app.media import encode_audio, merge_wavs, read_pcm, split_text, write_wav
+from speech_proxy.app import create_app
+from speech_proxy.config import Settings
+from speech_proxy.errors import APIError
 
-KEY = "sk-local-unit-test-key-" + "x" * 40
-AUTH = {"Authorization": f"Bearer {KEY}"}
-
-
-def pcm_fixture() -> bytes:
-    return b"".join(struct.pack("<h", int(2000 * math.sin(2 * math.pi * 440 * i / 24000)))
-                    for i in range(4800))
+KEY = "test-private-key-for-local-gateway-123456789"
 
 
-class FakeTokens:
-    async def headers(self):
-        return {"Authorization": "Bearer fake-google", "x-goog-user-project": "test-project"}
+def wav_audio(seconds=0.2):
+    pcm = b"".join(
+        struct.pack("<h", int(5000 * math.sin(2 * math.pi * 440 * i / 24000)))
+        for i in range(int(seconds * 24000))
+    )
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(24000)
+        stream.writeframes(pcm)
+    return buffer.getvalue(), pcm
 
 
-class Upstream:
-    def __init__(self):
-        self.google_calls = []
-        self.groq_calls = []
-        self.failure = None
-
-    def handle(self, request: httpx.Request):
-        if request.url.host == "api.groq.com":
-            assert request.headers["authorization"] == "Bearer fake-groq"
-            self.groq_calls.append(request)
-            if self.failure:
-                return self.failure(request)
-            message = BytesParser(policy=default).parsebytes(
-                b"Content-Type: " + request.headers["content-type"].encode() + b"\r\n\r\n" + request.content)
-            fields = {}
-            for part in message.iter_parts():
-                name = part.get_param("name", header="content-disposition")
-                if name != "file":
-                    fields.setdefault(name, []).append(part.get_payload(decode=True).decode())
-            assert fields["model"] == ["whisper-large-v3-turbo"]
-            result = {"text": "안녕하세요.", "language": "korean", "duration": 1.2,
-                      "segments": [{"id": 0, "start": 0.0, "end": 1.2, "text": "안녕하세요."}],
-                      "x_groq": {"id": "test"}}
-            if fields.get("response_format") == ["text"]:
-                return httpx.Response(200, text=result["text"])
-            return httpx.Response(200, json=result, headers={"x-ratelimit-remaining-requests": "1999"})
-        assert request.url.host == "texttospeech.googleapis.com"
-        assert request.headers["authorization"] == "Bearer fake-google"
-        payload = json.loads(request.content)
-        self.google_calls.append(payload)
-        if self.failure:
-            return self.failure(request)
-        assert len(payload["input"]["text"].encode()) <= 4500
-        assert payload["audioConfig"]["audioEncoding"] == "LINEAR16"
-        assert 0.25 <= payload["audioConfig"]["speakingRate"] <= 2
-        return httpx.Response(200, json={"audioContent": base64.b64encode(write_wav(pcm_fixture())).decode()})
+def multipart_fields(request):
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {request.headers['content-type']}\r\n\r\n".encode() + request.content
+    )
+    result = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        result.setdefault(name, []).append(part.get_payload(decode=True))
+    return result
 
 
 @pytest.fixture
 def gateway(tmp_path):
-    settings = Settings(KEY, "fake-groq", "test-project", data_dir=tmp_path)
-    upstream = Upstream()
-    app = create_app(settings, transport=httpx.MockTransport(upstream.handle), tokens=FakeTokens())
-    with TestClient(app) as client:
-        yield client, upstream, settings
+    @asynccontextmanager
+    async def start(**overrides):
+        state = SimpleNamespace(
+            google_calls=[],
+            groq_calls=[],
+            auth_calls=0,
+            google_status=200,
+            groq_status=200,
+            auth_failure=False,
+            google_failure=None,
+            groq_failure=None,
+            google_delay=0,
+            transcript={
+                "text": "안녕하세요",
+                "segments": [{"id": 0, "start": 0.05, "end": 1.25, "text": "안녕하세요"}],
+                "x_groq": {"id": "not-openai-metadata"},
+            },
+            audio=wav_audio()[0],
+            pcm=wav_audio()[1],
+            google_started=asyncio.Event(),
+        )
+
+        async def tokens():
+            state.auth_calls += 1
+            if state.auth_failure:
+                raise APIError(503, "ADC unavailable", "provider_not_configured")
+            return {"Authorization": "Bearer fake-google-token"}
+
+        async def handler(request):
+            if request.url.host == "texttospeech.googleapis.com":
+                state.google_calls.append(json.loads(request.content))
+                state.google_started.set()
+                if state.google_delay:
+                    await asyncio.sleep(state.google_delay)
+                if state.google_failure:
+                    raise state.google_failure
+                return httpx.Response(
+                    state.google_status,
+                    json={"audioContent": base64.b64encode(state.audio).decode()},
+                    headers={"Retry-After": "7"},
+                )
+            if request.url.host == "api.groq.com":
+                fields = multipart_fields(request)
+                state.groq_calls.append(fields)
+                if state.groq_failure:
+                    raise state.groq_failure
+                if fields["response_format"] == [b"text"]:
+                    return httpx.Response(state.groq_status, text="안녕하세요")
+                return httpx.Response(
+                    state.groq_status, json=state.transcript, headers={"Retry-After": "7"}
+                )
+            raise AssertionError(f"Unexpected host: {request.url.host}")
+
+        settings = Settings(
+            _env_file=None,
+            **{
+                "proxy_api_key": KEY,
+                "groq_api_key": "fake-groq-key",
+                "groq_free_tier_confirmed": True,
+                "usage_db_path": str(tmp_path / "usage.sqlite3"),
+                **overrides,
+            },
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+            app = create_app(settings, http_client=upstream, google_token_provider=tokens)
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://gateway",
+                    headers={"Authorization": f"Bearer {KEY}"},
+                ) as client:
+                    yield client, state, app
+
+    return start
 
 
-def speak(client, **kwargs):
-    return client.post("/v1/audio/speech", headers=AUTH,
-                       json={"model": "tts-1", "input": "안녕하세요.", "voice": "alloy", "response_format": "wav", **kwargs})
+def speech_body(**overrides):
+    return {"model": "tts-1", "voice": "alloy", "input": "안녕하세요", **overrides}
 
 
-def transcribe(client, **kwargs):
-    return client.post("/v1/audio/transcriptions", headers=AUTH,
-                       data={"model": "whisper-1", **kwargs}, files={"file": ("recording.wav", b"testaudio", "audio/wav")})
+async def transcribe(client, **fields):
+    return await client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "whisper-1", **fields},
+        files={"file": ("audio.wav", wav_audio()[0], "audio/wav")},
+    )
 
 
-def test_health_is_not_upstream_probe(gateway):
-    client, upstream, _ = gateway
-    assert client.get("/health").json() == {"status": "ok", "upstreams_verified": False}
-    assert not upstream.google_calls and not upstream.groq_calls
+async def counters(client):
+    return (await client.get("/usage")).json()["usage"]
 
 
-def test_authentication(gateway):
-    client, upstream, _ = gateway
-    response = client.post("/v1/audio/speech", json={"input": "secret"})
-    assert response.status_code == 401
-    assert response.json()["error"]["code"] == "invalid_api_key"
-    assert "secret" not in response.text
-    assert not upstream.google_calls
+async def test_health_auth_discovery(gateway):
+    async with gateway() as (client, state, _):
+        client.headers.pop("authorization")
+        health = await client.get("/health")
+        assert health.status_code == 200
+        for path in ("/usage", "/ready", "/v1/models", "/v1/voices"):
+            response = await client.get(path)
+            assert response.status_code == 401
+            assert response.json()["error"]["type"] == "authentication_error"
+            assert response.headers["www-authenticate"] == "Bearer"
+            assert response.headers["x-request-id"]
+        client.headers["authorization"] = f"bearer {KEY}"
+        assert (await client.get("/ready")).json()["upstream_verified"] is False
+        assert "tts-1-hd" in {
+            item["id"] for item in (await client.get("/v1/models")).json()["data"]
+        }
+        voices = (await client.get("/v1/voices")).json()["data"]
+        assert next(v for v in voices if v["id"] == "cedar")["provider_voice"].endswith("D")
+        assert not state.google_calls and not state.groq_calls and not state.auth_calls
 
 
-def test_model_and_voice_discovery(gateway):
-    client, _, _ = gateway
-    assert {x["id"] for x in client.get("/v1/models", headers=AUTH).json()["data"]} == {
-        "tts-1", "google-wavenet", "whisper-1", "whisper-large-v3-turbo"}
-    assert client.get("/v1/voices", headers=AUTH).status_code == 200
-    assert client.get("/usage").status_code == 401
+@pytest.mark.parametrize("fmt", ["json", "text", "verbose_json", "srt", "vtt"])
+async def test_transcription_formats_and_korean_default(gateway, fmt):
+    async with gateway() as (client, state, _):
+        result = await transcribe(client, response_format=fmt)
+        assert result.status_code == 200, result.text
+        fields = state.groq_calls[0]
+        assert fields["model"] == [b"whisper-large-v3-turbo"]
+        assert fields["language"] == [b"ko"]
+        assert result.headers["x-speech-provider"] == "groq"
+        assert "안녕하세요" in result.text
+        if fmt in {"srt", "vtt"}:
+            assert fields["response_format"] == [b"verbose_json"]
+            assert fields["timestamp_granularities[]"] == [b"segment"]
+            assert ("00:00:00,050" if fmt == "srt" else "00:00:00.050") in result.text
+        elif fmt != "text":
+            assert "x_groq" not in result.json()
+        assert (await counters(client))["groq_stt"]["audio_day"]["amount"] == 10
 
 
-def test_asr_alias_and_metadata(gateway):
-    client, upstream, _ = gateway
-    response = transcribe(client, language="ko")
-    assert response.status_code == 200
-    assert response.json()["text"] == "안녕하세요."
-    assert "x_groq" not in response.json()
-    assert response.headers["x-speech-model"] == "whisper-large-v3-turbo"
-    assert response.headers["x-ratelimit-remaining-requests"] == "1999"
-    assert len(upstream.groq_calls) == 1
+async def test_explicit_groq_model_and_auto_language(gateway):
+    async with gateway(asr_default_language="auto") as (client, state, _):
+        result = await transcribe(client, model="whisper-large-v3")
+        assert result.status_code == 200
+        assert state.groq_calls[0]["model"] == [b"whisper-large-v3"]
+        assert "language" not in state.groq_calls[0]
+        assert result.headers["x-speech-model"] == "whisper-large-v3"
 
 
-@pytest.mark.parametrize("fmt", ["text", "json", "verbose_json", "srt", "vtt"])
-def test_asr_formats(gateway, fmt):
-    client, _, _ = gateway
-    response = transcribe(client, response_format=fmt)
-    assert response.status_code == 200
-    if fmt == "srt":
-        assert "00:00:00,000 --> 00:00:01,200" in response.text
-    if fmt == "vtt":
-        assert response.text.startswith("WEBVTT")
-    if fmt == "text":
-        assert response.text == "안녕하세요."
+async def test_repeated_timestamp_granularities(gateway):
+    async with gateway() as (client, state, _):
+        result = await transcribe(
+            client,
+            response_format="verbose_json",
+            **{"timestamp_granularities[]": ["word", "segment"]},
+        )
+        assert result.status_code == 200
+        assert state.groq_calls[0]["timestamp_granularities[]"] == [b"word", b"segment"]
 
 
-def test_asr_timestamp_list(gateway):
-    client, upstream, _ = gateway
-    response = transcribe(client, response_format="verbose_json", **{"timestamp_granularities[]": ["word", "segment"]})
-    assert response.status_code == 200
-    assert b'word' in upstream.groq_calls[0].content
-    assert upstream.groq_calls[0].content.count(b'name="timestamp_granularities[]"') == 2
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"model": "unknown"},
+        {"response_format": "diarized_json"},
+        {"temperature": "NaN"},
+        {"temperature": "1.1"},
+        {"language": "Korean"},
+        {"stream": "true"},
+        {"timestamp_granularities[]": ["word"]},
+        {"extra": "unsupported"},
+    ],
+)
+async def test_invalid_transcription_never_calls_provider(gateway, fields):
+    async with gateway() as (client, state, _):
+        result = await transcribe(client, **fields)
+        assert result.status_code == 400
+        assert not state.groq_calls
+        assert (await counters(client))["groq_stt"]["day"]["requests"] == 0
 
 
-@pytest.mark.parametrize("extra", [
-    {"model": "gpt-4o-transcribe"}, {"stream": "true"}, {"language": "ko-KR"},
-    {"temperature": "nan"}, {"temperature": "3"}, {"response_format": "bad"},
-    {"timestamp_granularities[]": "word"}, {"include[]": "logprobs"},
-])
-def test_asr_rejects_unsupported(gateway, extra):
-    client, upstream, _ = gateway
-    assert transcribe(client, **extra).status_code == 400
-    assert not upstream.groq_calls
+@pytest.mark.parametrize("audio", [b"", b"not audio"])
+async def test_bad_audio_rejected_before_reservation(gateway, audio):
+    async with gateway() as (client, state, _):
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "whisper-1"},
+            files={"file": ("audio.wav", audio)},
+        )
+        assert response.status_code == 400
+        assert not state.groq_calls
+        assert (await counters(client))["groq_stt"]["day"]["requests"] == 0
 
 
-def test_asr_empty_file(gateway):
-    client, upstream, _ = gateway
-    response = client.post("/v1/audio/transcriptions", headers=AUTH, data={"model": "whisper-1"},
-                           files={"file": ("empty.wav", b"")})
-    assert response.status_code == 400
-    assert not upstream.groq_calls
+async def test_audio_size_and_duration_limits(gateway):
+    async with gateway(max_upload_bytes=100) as (client, state, _):
+        assert (await transcribe(client)).status_code == 413
+        assert not state.groq_calls
+    async with gateway(max_audio_seconds=0.05) as (client, state, _):
+        assert (await transcribe(client)).status_code == 400
+        assert not state.groq_calls
 
 
-def test_tts_alias_cache_and_quota(gateway):
-    client, upstream, _ = gateway
-    response = speak(client)
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "audio/wav"
-    assert response.headers["x-tts-cache"] == "MISS"
-    assert read_pcm(response.content) == pcm_fixture()
-    assert upstream.google_calls[0]["voice"]["name"] == "ko-KR-Wavenet-A"
-    again = speak(client)
-    assert again.headers["x-tts-cache"] == "HIT"
-    assert len(upstream.google_calls) == 1
-    assert client.get("/usage", headers=AUTH).json()["rolling_32_days"]["reserved"] == count_units("안녕하세요.")
+async def test_free_plan_confirmation(gateway):
+    async with gateway(groq_free_tier_confirmed=False) as (client, state, _):
+        response = await transcribe(client)
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "free_tier_not_confirmed"
+        assert not state.groq_calls
 
 
-@pytest.mark.parametrize("fmt,magic", [("mp3", b"ID3"), ("opus", b"OggS"), ("aac", b"\xff"),
-                                       ("flac", b"fLaC"), ("wav", b"RIFF"), ("pcm", None)])
-def test_tts_all_six_formats(gateway, fmt, magic):
-    client, _, _ = gateway
-    response = speak(client, response_format=fmt)
-    assert response.status_code == 200
-    if magic:
-        assert response.content.startswith(magic)
-    else:
-        assert response.content == pcm_fixture()
+async def test_groq_local_rate_limit_blocks_upstream(gateway):
+    async with gateway(groq_minute_request_limit=1) as (client, state, _):
+        assert (await transcribe(client)).status_code == 200
+        blocked = await transcribe(client)
+        assert blocked.status_code == 429
+        assert int(blocked.headers["retry-after"]) > 0
+        assert len(state.groq_calls) == 1
 
 
-def test_long_korean_is_split_without_losing_characters(gateway):
-    client, upstream, _ = gateway
-    text = "가나다라마바사 아자차카타파하. " * 150
-    response = speak(client, input=text)
-    assert response.status_code == 200
-    assert len(upstream.google_calls) >= 2
-    assert "".join(c["input"]["text"] for c in upstream.google_calls) == text
-    assert len(read_pcm(response.content)) == len(pcm_fixture()) * len(upstream.google_calls)
+@pytest.mark.parametrize(
+    "fmt,magic",
+    [
+        ("mp3", b"ID3"),
+        ("wav", b"RIFF"),
+        ("pcm", None),
+        ("opus", b"OggS"),
+        ("aac", b"\xff"),
+        ("flac", b"fLaC"),
+    ],
+)
+async def test_tts_formats_and_paseo_pcm(gateway, fmt, magic):
+    async with gateway() as (client, state, _):
+        response = await client.post("/v1/audio/speech", json=speech_body(response_format=fmt))
+        assert response.status_code == 200, response.text
+        assert response.headers["x-speech-voice"] == "ko-KR-Wavenet-A"
+        if magic:
+            assert response.content.startswith(magic)
+        else:
+            assert response.content == state.pcm
+        sent = state.google_calls[0]
+        assert sent["audioConfig"] == {
+            "audioEncoding": "LINEAR16",
+            "sampleRateHertz": 24000,
+            "speakingRate": 1.0,
+        }
 
 
-@pytest.mark.parametrize("extra", [
-    {"voice": "ko-KR-Chirp3-HD-Kore"}, {"model": "tts-1-hd"},
-    {"instructions": "whisper softly"}, {"stream_format": "sse"},
-    {"input": "   "}, {"input": "가" * 4097}, {"speed": 4.1}, {"speed": 0.1},
-    {"response_format": "bad"}, {"surprise": "not supported"},
-])
-def test_tts_rejects_unsupported_before_billing(gateway, extra):
-    client, upstream, _ = gateway
-    response = speak(client, **extra)
-    assert response.status_code == 400
-    assert not upstream.google_calls
-    assert client.get("/usage", headers=AUTH).json()["rolling_32_days"]["reserved"] == 0
+async def test_original_models_voices_speed_and_default_voice(gateway):
+    async with gateway() as (client, state, _):
+        response = await client.post(
+            "/v1/audio/speech", json=speech_body(model="google-wavenet", voice="cedar", speed=4)
+        )
+        assert response.status_code == 200
+        assert state.google_calls[0]["audioConfig"]["speakingRate"] == 2
+        assert state.google_calls[0]["voice"]["name"] == "ko-KR-Wavenet-D"
+        response = await client.post(
+            "/v1/audio/speech", json={"model": "tts-1-hd", "input": "기본"}
+        )
+        assert response.status_code == 200
 
 
-def test_speed_four_uses_ffmpeg_after_google(gateway):
-    client, upstream, _ = gateway
-    response = speak(client, speed=4.0)
-    assert response.status_code == 200
-    assert upstream.google_calls[0]["audioConfig"]["speakingRate"] == 2.0
-    assert len(read_pcm(response.content)) < len(pcm_fixture())
+async def test_long_korean_unicode_text_split_and_accounting(gateway):
+    text = "안녕하세요! 🙂\n" * 500
+    async with gateway() as (client, state, _):
+        response = await client.post(
+            "/v1/audio/speech", json=speech_body(input=text, response_format="wav")
+        )
+        assert response.status_code == 200
+        chunks = [call["input"]["text"] for call in state.google_calls]
+        assert len(chunks) > 1 and "".join(chunks) == text
+        assert all(len(chunk.encode()) <= 4500 for chunk in chunks)
+        with wave.open(io.BytesIO(response.content)) as audio:
+            assert audio.getnframes() * 2 == len(state.pcm) * len(chunks)
+        assert (await counters(client))["google_tts"]["32_days"]["amount"] == len(
+            text.encode("utf-16-le")
+        ) // 2
 
 
-def test_tts_quota_blocks_upstream(tmp_path):
-    settings = Settings(KEY, "fake-groq", "test-project", data_dir=tmp_path, tts_limit=5, tts_daily_limit=5)
-    upstream = Upstream()
-    with TestClient(create_app(settings, transport=httpx.MockTransport(upstream.handle), tokens=FakeTokens())) as client:
-        response = speak(client, input="가" * 6)
+async def test_cache_cross_format_and_single_concurrent_synthesis(gateway):
+    async with gateway() as (client, state, app):
+        state.google_delay = 0.05
+        responses = await asyncio.gather(
+            *(
+                client.post("/v1/audio/speech", json=speech_body(response_format=fmt))
+                for fmt in ("pcm", "wav", "mp3", "opus")
+            )
+        )
+        assert all(response.status_code == 200 for response in responses)
+        assert len(state.google_calls) == 1
+        assert [r.headers["x-tts-cache"] for r in responses].count("MISS") == 1
+        assert (await counters(client))["google_tts"]["32_days"]["amount"] == len("안녕하세요")
+        assert not app.state.synthesis_locks
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"input": " "},
+        {"input": "\ud800"},
+        {"voice": "ko-KR-Neural2-A"},
+        {"model": "unknown"},
+        {"response_format": "invalid"},
+        {"speed": 4.1},
+        {"instructions": "Speak softly"},
+        {"stream_format": "sse"},
+        {"unsupported": "value"},
+    ],
+)
+async def test_invalid_tts_does_not_spend_quota(gateway, override):
+    async with gateway() as (client, state, _):
+        response = await client.post(
+            "/v1/audio/speech",
+            content=json.dumps(speech_body(**override)),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 400
+        assert not state.google_calls and state.auth_calls == 0
+        assert (await counters(client))["google_tts"]["32_days"]["amount"] == 0
+
+
+async def test_adc_failure_does_not_spend_quota(gateway):
+    async with gateway() as (client, state, _):
+        state.auth_failure = True
+        response = await client.post("/v1/audio/speech", json=speech_body())
+        assert response.status_code == 503
+        assert not state.google_calls
+        assert (await counters(client))["google_tts"]["32_days"]["amount"] == 0
+
+
+async def test_tts_quota_full_text_reservation_before_first_chunk(gateway):
+    async with gateway(tts_32day_char_limit=10) as (client, state, _):
+        response = await client.post("/v1/audio/speech", json=speech_body(input="가" * 3000))
         assert response.status_code == 429
-        assert response.json()["error"]["code"] == "local_tts_limit"
-        assert not upstream.google_calls
+        assert not state.google_calls
 
 
-def test_groq_429_passthrough_no_retry(gateway):
-    client, upstream, _ = gateway
-    upstream.failure = lambda request: httpx.Response(429, json={"error": "limit"}, headers={"retry-after": "7"})
-    response = transcribe(client)
-    assert response.status_code == 429
-    assert response.headers["retry-after"] == "7"
-    assert len(upstream.groq_calls) == 1
+async def test_provider_timeout_keeps_reservation_without_retry(gateway):
+    async with gateway() as (client, state, _):
+        state.google_failure = httpx.ReadTimeout("must-not-echo-secret")
+        response = await client.post("/v1/audio/speech", json=speech_body())
+        assert response.status_code == 504
+        assert "must-not-echo-secret" not in response.text
+        assert len(state.google_calls) == 1
+        assert (await counters(client))["google_tts"]["32_days"]["amount"] == len("안녕하세요")
 
 
-def test_tts_timeout_reservation_retained(gateway):
-    client, upstream, _ = gateway
-    def timeout(request):
-        raise httpx.ReadTimeout("timeout", request=request)
-    upstream.failure = timeout
-    assert speak(client).status_code == 504
-    assert len(upstream.google_calls) == 1
-    assert client.get("/usage", headers=AUTH).json()["rolling_32_days"]["reserved"] == count_units("안녕하세요.")
+async def test_upstream_429_retry_after_and_no_retry(gateway):
+    async with gateway() as (client, state, _):
+        state.groq_status = 429
+        response = await transcribe(client)
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == "7"
+        assert len(state.groq_calls) == 1
 
 
-def test_google_auth_failure_does_not_spend_quota(gateway):
-    client, _, _ = gateway
-    class BadTokens:
-        async def headers(self):
-            raise APIError(503, "Missing ADC", "google_auth_failed")
-    client.app.state.providers.tokens = BadTokens()
-    assert speak(client).status_code == 503
-    assert client.get("/usage", headers=AUTH).json()["rolling_32_days"]["reserved"] == 0
+async def test_malformed_upstream_audio_and_subtitle_data(gateway):
+    async with gateway() as (client, state, _):
+        state.audio = b"invalid wav"
+        assert (await client.post("/v1/audio/speech", json=speech_body())).status_code == 502
+        state.transcript["segments"] = []
+        assert (await transcribe(client, response_format="srt")).status_code == 502
 
 
-def test_malformed_upstream_audio_is_safe(gateway):
-    client, upstream, _ = gateway
-    upstream.failure = lambda request: httpx.Response(200, json={"audioContent": "not-valid-base64@@"})
-    response = speak(client)
-    assert response.status_code == 502
-    assert "안녕하세요" not in response.text
+async def test_request_guard_chunked_body_limit_before_parse(gateway):
+    async with gateway(max_tts_input_chars=1) as (client, state, _):
+
+        async def chunks():
+            yield b"x" * 4096
+            yield b"x" * 4096
+            yield b"x" * 100
+
+        response = await client.post("/v1/audio/speech", content=chunks())
+        assert response.status_code == 413
+        assert not state.google_calls
 
 
-def test_json_error_does_not_echo_secret(gateway):
-    client, _, _ = gateway
-    response = client.post("/v1/audio/speech", headers=AUTH, content='{"private_secret": ',
-                           extensions={},)
-    assert response.status_code == 400
-    assert "private_secret" not in response.text
+async def test_auth_precedes_body_consumption(gateway):
+    async with gateway() as (client, state, _):
+
+        async def chunks():
+            raise AssertionError("Unauthenticated body should never be consumed")
+            yield b""  # pragma: no cover
+
+        response = await client.post(
+            "/v1/audio/speech", content=chunks(), headers={"Authorization": "Bearer invalid"}
+        )
+        assert response.status_code == 401
+        assert not state.google_calls
 
 
-def test_body_limit(gateway):
-    client, upstream, _ = gateway
-    response = client.post("/v1/audio/speech", headers=AUTH, content=b"x" * 128001)
-    assert response.status_code == 413
-    assert not upstream.google_calls
+async def test_busy_requests_are_rejected_and_slots_recover(gateway):
+    async with gateway(max_concurrent_requests=1) as (client, state, _):
+        state.google_delay = 0.1
+        first = asyncio.create_task(client.post("/v1/audio/speech", json=speech_body()))
+        await asyncio.wait_for(state.google_started.wait(), timeout=5)
+        second = await client.post("/v1/audio/speech", json=speech_body(input="다음"))
+        assert second.status_code == 503
+        assert (await first).status_code == 200
+        assert (await client.post("/v1/audio/speech", json=speech_body())).status_code == 200
 
 
-def test_file_limit(tmp_path):
-    settings = Settings(KEY, "fake-groq", "test-project", data_dir=tmp_path, max_file_bytes=8)
-    upstream = Upstream()
-    with TestClient(create_app(settings, transport=httpx.MockTransport(upstream.handle), tokens=FakeTokens())) as client:
-        assert transcribe(client).status_code == 413
-        assert not upstream.groq_calls
+async def test_overall_request_timeout_and_lock_cleanup(gateway):
+    async with gateway(request_timeout_seconds=0.05) as (client, state, app):
+        state.google_delay = 0.2
+        response = await client.post("/v1/audio/speech", json=speech_body())
+        assert response.status_code == 504
+        assert not app.state.synthesis_locks
+        assert (await counters(client))["google_tts"]["32_days"]["amount"] == len("안녕하세요")
 
 
-def test_ledger_persists_and_expires(tmp_path):
-    settings = Settings(KEY, "fake-groq", "test-project", data_dir=tmp_path)
-    ledger = UsageLedger(settings)
-    ledger.reserve(100, now=10000000)
-    fresh = UsageLedger(settings)
-    assert fresh.snapshot(now=10000001)["rolling_32_days"]["reserved"] == 100
-    assert fresh.snapshot(now=10000000 + WINDOW_SECONDS + 1)["rolling_32_days"]["reserved"] == 0
-
-
-def test_ledger_atomic_concurrent_reservations(tmp_path):
-    settings = Settings(KEY, "fake-groq", "test-project", data_dir=tmp_path, tts_limit=10, tts_daily_limit=10)
-    ledger = UsageLedger(settings)
-    barrier = threading.Barrier(10)
-    def reserve(_):
-        barrier.wait()
-        try:
-            ledger.reserve(2)
-            return True
-        except APIError:
-            return False
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        results = list(pool.map(reserve, range(10)))
-    assert sum(results) == 5
-    assert ledger.snapshot()["rolling_32_days"]["reserved"] == 10
-
-
-def test_utf8_split_and_utf16_accounting():
-    text = "한국어 👨‍👩‍👦 punctuation.\n" * 500
-    chunks = split_text(text)
-    assert "".join(chunks) == text
-    assert all(len(c.encode()) <= 4500 for c in chunks)
-    assert count_units("가나") == 2
-    assert count_units("😀") == 2
-
-
-def test_cache_byte_bound():
-    cache = AudioCache(10, 60)
-    cache.put("a", b"123456")
-    cache.put("b", b"123456")
-    assert cache.get("a") is None
-    assert cache.get("b") == b"123456"
-    cache.put("big", b"x" * 11)
-    assert cache.get("big") is None
-    assert cache.size == 6
-
-
-def test_wave_merge_has_valid_header():
-    wav = write_wav(pcm_fixture())
-    merged = merge_wavs([wav, wav])
-    with wave.open(io.BytesIO(merged), "rb") as audio:
-        assert audio.getnframes() == 9600
-    assert read_pcm(merged) == pcm_fixture() * 2
+async def test_openai_sdk_transcription_and_binary_streaming(gateway, tmp_path):
+    async with gateway() as (client, state, _):
+        sdk = AsyncOpenAI(
+            api_key=KEY, base_url="http://gateway/v1", http_client=client, max_retries=0
+        )
+        result = await sdk.audio.transcriptions.create(
+            file=("speech.wav", wav_audio()[0], "audio/wav"), model="whisper-1", language="ko"
+        )
+        assert result.text == "안녕하세요"
+        async with sdk.audio.speech.with_streaming_response.create(
+            model="tts-1", voice="alloy", input="Paseo 음성 확인", response_format="pcm"
+        ) as response:
+            destination = tmp_path / "speech.pcm"
+            await response.stream_to_file(destination)
+        assert destination.read_bytes() == state.pcm
+        assert (await sdk.models.list()).data
